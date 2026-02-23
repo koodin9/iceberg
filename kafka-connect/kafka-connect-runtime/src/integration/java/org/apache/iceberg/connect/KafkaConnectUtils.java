@@ -71,9 +71,16 @@ public class KafkaConnectUtils {
               String.format(
                   Locale.ROOT, "http://localhost:%d/connectors", TestContext.CONNECT_PORT));
       String body = TestContext.MAPPER.writeValueAsString(config);
+      System.out.println("=== Connector config: " + body);
       request.setHeader("Content-Type", "application/json");
       request.setEntity(new StringEntity(body));
-      HTTP.execute(request, response -> null);
+      HTTP.execute(
+          request,
+          response -> {
+            String responseBody = new String(response.getEntity().getContent().readAllBytes());
+            System.out.println("=== Response [" + response.getCode() + "]: " + responseBody);
+            return null;
+          });
     } catch (IOException e) {
       throw new RuntimeException(e);
     }

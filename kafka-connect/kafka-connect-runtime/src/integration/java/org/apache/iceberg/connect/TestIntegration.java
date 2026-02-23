@@ -36,6 +36,8 @@ import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.LongType;
 import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.types.Types.TimestampType;
+import org.awaitility.Awaitility;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -44,6 +46,18 @@ public class TestIntegration extends IntegrationTestBase {
 
   private static final String TEST_TABLE = "foobar";
   private static final TableIdentifier TABLE_IDENTIFIER = TableIdentifier.of(TEST_DB, TEST_TABLE);
+
+  @BeforeEach
+  public void before() {
+    // Initialize DDL execution state for the test table
+    context.initializeDdlExecution(
+        0,
+        1L,
+        "CREATE TABLE " + context.getFullTableName(TEST_DB, TEST_TABLE),
+        "Initial test data",
+        TEST_DB,
+        TEST_TABLE);
+  }
 
   @ParameterizedTest
   @NullSource
@@ -156,11 +170,12 @@ public class TestIntegration extends IntegrationTestBase {
   @Override
   protected KafkaConnectUtils.Config createConfig(boolean useSchema) {
     return createCommonConfig(useSchema)
-        .config("iceberg.tables", String.format("%s.%s", TEST_DB, TEST_TABLE));
+        .config("iceberg.tables", String.format("%s.%s", TEST_DB, TEST_TABLE))
+        .config("iceberg.kakao.cdc.enabled", false);
   }
 
   @Override
-  protected void sendEvents(boolean useSchema) {
+  protected void runIntegrationFlow(boolean useSchema) {
     TestEvent event1 = new TestEvent(1, "type1", Instant.now(), "hello world!");
 
     Instant threeDaysAgo = Instant.now().minus(Duration.ofDays(3));
@@ -168,6 +183,13 @@ public class TestIntegration extends IntegrationTestBase {
 
     send(testTopic(), event1, useSchema);
     send(testTopic(), event2, useSchema);
+
+    flush();
+
+    Awaitility.await()
+        .atMost(Duration.ofSeconds(30))
+        .pollInterval(Duration.ofSeconds(1))
+        .untilAsserted(() -> assertSnapshotAdded(List.of(TABLE_IDENTIFIER), 1));
   }
 
   @Override

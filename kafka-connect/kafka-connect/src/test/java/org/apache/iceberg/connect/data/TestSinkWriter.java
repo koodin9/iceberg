@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
@@ -38,6 +39,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.IcebergSinkConfig;
 import org.apache.iceberg.connect.TableSinkConfig;
+import org.apache.iceberg.connect.cmdb.CmdbManager;
+import org.apache.iceberg.connect.cmdb.CmdbManagerFactory;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -48,10 +51,13 @@ import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
 
 public class TestSinkWriter {
 
   private InMemoryCatalog catalog;
+  private MockedStatic<CmdbManagerFactory> mockCmdbManagerFactory;
+  private CmdbManager mockCmdbManager;
 
   private static final Namespace NAMESPACE = Namespace.of("db");
   private static final String TABLE_NAME = "tbl";
@@ -68,11 +74,18 @@ public class TestSinkWriter {
     catalog = initInMemoryCatalog();
     catalog.createNamespace(NAMESPACE);
     catalog.createTable(TABLE_IDENTIFIER, SCHEMA);
+
+    mockCmdbManager = mock(CmdbManager.class);
+    mockCmdbManagerFactory = mockStatic(CmdbManagerFactory.class);
+    mockCmdbManagerFactory
+        .when(() -> CmdbManagerFactory.getInstance(any()))
+        .thenReturn(mockCmdbManager);
   }
 
   @AfterEach
   public void after() throws IOException {
     catalog.close();
+    mockCmdbManagerFactory.close();
   }
 
   private InMemoryCatalog initInMemoryCatalog() {

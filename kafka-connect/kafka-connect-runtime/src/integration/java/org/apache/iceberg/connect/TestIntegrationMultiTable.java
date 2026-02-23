@@ -20,11 +20,14 @@ package org.apache.iceberg.connect;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.awaitility.Awaitility;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -35,6 +38,27 @@ public class TestIntegrationMultiTable extends IntegrationTestBase {
   private static final String TEST_TABLE2 = "foobar2";
   private static final TableIdentifier TABLE_IDENTIFIER1 = TableIdentifier.of(TEST_DB, TEST_TABLE1);
   private static final TableIdentifier TABLE_IDENTIFIER2 = TableIdentifier.of(TEST_DB, TEST_TABLE2);
+
+  @BeforeEach
+  public void before() {
+    context.getApiServer().resetHandlers();
+
+    context.initializeDdlExecution(
+        0,
+        1L,
+        "CREATE TABLE " + context.getFullTableName(TEST_DB, TEST_TABLE1),
+        "Initial test data",
+        TEST_DB,
+        TEST_TABLE1);
+
+    context.initializeDdlExecution(
+        1,
+        1L,
+        "CREATE TABLE " + context.getFullTableName(TEST_DB, TEST_TABLE2),
+        "Initial test data",
+        TEST_DB,
+        TEST_TABLE2);
+  }
 
   @ParameterizedTest
   @NullSource
@@ -67,11 +91,12 @@ public class TestIntegrationMultiTable extends IntegrationTestBase {
             String.format("%s.%s, %s.%s", TEST_DB, TEST_TABLE1, TEST_DB, TEST_TABLE2))
         .config("iceberg.tables.route-field", "type")
         .config(String.format("iceberg.table.%s.%s.route-regex", TEST_DB, TEST_TABLE1), "type1")
-        .config(String.format("iceberg.table.%s.%s.route-regex", TEST_DB, TEST_TABLE2), "type2");
+        .config(String.format("iceberg.table.%s.%s.route-regex", TEST_DB, TEST_TABLE2), "type2")
+        .config("iceberg.kakao.cdc.enabled", false);
   }
 
   @Override
-  protected void sendEvents(boolean useSchema) {
+  protected void runIntegrationFlow(boolean useSchema) {
     TestEvent event1 = new TestEvent(1, "type1", Instant.now(), "hello world!");
     TestEvent event2 = new TestEvent(2, "type2", Instant.now(), "having fun?");
     TestEvent event3 = new TestEvent(3, "type3", Instant.now(), "ignore me");
@@ -79,6 +104,13 @@ public class TestIntegrationMultiTable extends IntegrationTestBase {
     send(testTopic(), event1, useSchema);
     send(testTopic(), event2, useSchema);
     send(testTopic(), event3, useSchema);
+
+    flush();
+
+    Awaitility.await()
+        .atMost(Duration.ofSeconds(30))
+        .pollInterval(Duration.ofSeconds(1))
+        .untilAsserted(() -> assertSnapshotAdded(List.of(TABLE_IDENTIFIER1, TABLE_IDENTIFIER2), 1));
   }
 
   @Override

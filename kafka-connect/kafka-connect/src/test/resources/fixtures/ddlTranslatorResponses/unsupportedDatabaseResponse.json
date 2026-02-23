@@ -1,0 +1,7 @@
+{
+  "timestamp": "2025-02-18T06:16:37.422141257",
+  "status": 400,
+  "error": "Bad Request",
+  "code": "UNSUPPORTED_DATABASE",
+  "message": "Unsupported database type: unsupported_db"
+}

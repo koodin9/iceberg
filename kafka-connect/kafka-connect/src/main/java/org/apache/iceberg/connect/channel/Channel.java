@@ -22,11 +22,11 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import org.apache.iceberg.connect.IcebergSinkConfig;
 import org.apache.iceberg.connect.data.Offset;
 import org.apache.iceberg.connect.events.AvroUtil;
 import org.apache.iceberg.connect.events.Event;
+import org.apache.iceberg.relocated.com.google.common.base.Splitter;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -66,7 +66,10 @@ abstract class Channel {
 
     String transactionalId = config.transactionalPrefix() + name + config.transactionalSuffix();
     this.producer = clientFactory.createProducer(transactionalId);
-    this.consumer = clientFactory.createConsumer(consumerGroupId);
+    this.consumer =
+        clientFactory.createConsumer(
+            getConsumerId(name, consumerGroupId, config.transactionalSuffix()),
+            getAutoOffsetReset(name));
     this.admin = clientFactory.createAdmin();
 
     this.producerId = UUID.randomUUID().toString();
@@ -90,7 +93,7 @@ abstract class Channel {
                   // key by producer ID to keep event order
                   return new ProducerRecord<>(controlTopic, producerId, data);
                 })
-            .collect(Collectors.toList());
+            .toList();
 
     synchronized (producer) {
       producer.beginTransaction();
@@ -163,5 +166,34 @@ abstract class Channel {
     producer.close();
     consumer.close();
     admin.close();
+  }
+
+  private String getConsumerId(String name, String consumerGroupId, String txnSuffix) {
+    String consumerId = consumerGroupId + "-" + name;
+    if (!name.equalsIgnoreCase("worker")) {
+      return consumerId;
+    }
+
+    return consumerId + "-" + extractTaskId(txnSuffix);
+  }
+
+  private static String extractTaskId(String transactionalSuffix) {
+    // transactionalSuffix format: "-txn-UUID-taskNumber"
+    if (transactionalSuffix == null) {
+      return "task-unknown";
+    }
+
+    List<String> parts = Splitter.on('-').splitToList(transactionalSuffix);
+    if (!parts.isEmpty()) {
+      String lastPart = parts.get(parts.size() - 1);
+      return "task-" + lastPart;
+    }
+
+    return "task-unknown";
+  }
+
+  // Default: Worker 만 earliest
+  private String getAutoOffsetReset(String name) {
+    return name.equalsIgnoreCase("worker") ? "earliest" : "latest";
   }
 }

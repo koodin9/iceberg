@@ -37,6 +37,7 @@ import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.PayloadType;
 import org.apache.iceberg.connect.events.StartCommit;
+import org.apache.iceberg.connect.metrics.PendingRecordCustomMetrics;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -80,7 +81,10 @@ public class TestWorker extends ChannelTestBase {
       SinkWriter sinkWriter = mock(SinkWriter.class);
       when(sinkWriter.completeWrite()).thenReturn(sinkWriterResult);
 
-      Worker worker = new Worker(config, clientFactory, sinkWriter, context);
+      PendingRecordCustomMetrics pendingRecordCustomMetrics =
+          mock(PendingRecordCustomMetrics.class);
+      Worker worker =
+          new Worker(config, clientFactory, sinkWriter, context, null, pendingRecordCustomMetrics);
       worker.start();
 
       // init consumer after subscribe()
@@ -89,6 +93,8 @@ public class TestWorker extends ChannelTestBase {
       // save a record
       Map<String, Object> value = ImmutableMap.of();
       SinkRecord rec = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null, value, 0L);
+      rec.headers().addString("dml_info", "{\"gtid\":\"abc123\",\"pos\":\"456\",\"row\":\"10\"}");
+      rec.headers().addString("ddl_version", "999");
       worker.save(ImmutableList.of(rec));
 
       UUID commitId = UUID.randomUUID();

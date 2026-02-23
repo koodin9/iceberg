@@ -18,13 +18,18 @@
  */
 package org.apache.iceberg.connect.channel;
 
+import java.lang.management.ManagementFactory;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.management.MBeanServer;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.connect.Committer;
 import org.apache.iceberg.connect.IcebergSinkConfig;
 import org.apache.iceberg.connect.data.SinkWriter;
+import org.apache.iceberg.connect.metrics.MBeanRegisterFactory;
+import org.apache.iceberg.connect.metrics.PendingRecordCustomMetrics;
+import org.apache.iceberg.connect.metrics.ProcessCustomMetrics;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
@@ -47,6 +52,8 @@ public class CommitterImpl implements Committer {
   private SinkTaskContext context;
   private KafkaClientFactory clientFactory;
   private Collection<MemberDescription> membersWhenWorkerIsCoordinator;
+  private ProcessCustomMetrics processCustomMetrics;
+  private PendingRecordCustomMetrics pendingRecordCustomMetrics;
   private final AtomicBoolean isInitialized = new AtomicBoolean(false);
 
   private void initialize(
@@ -121,6 +128,17 @@ public class CommitterImpl implements Committer {
       SinkTaskContext sinkTaskContext,
       Collection<TopicPartition> addedPartitions) {
     initialize(icebergCatalog, icebergSinkConfig, sinkTaskContext);
+
+    MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+    String connectorName = context.configs().get("name");
+
+    processCustomMetrics =
+        MBeanRegisterFactory.initializeProcessLatencyMBeans(mBeanServer, connectorName);
+    processCustomMetrics.registerProcessMBean();
+
+    pendingRecordCustomMetrics =
+        MBeanRegisterFactory.initializePendingRecordMBeans(mBeanServer, connectorName);
+    pendingRecordCustomMetrics.registerPartitionMBean(addedPartitions);
     if (hasLeaderPartition(addedPartitions)) {
       LOG.info("Committer received leader partition. Starting Coordinator.");
       startCoordinator();
@@ -136,6 +154,9 @@ public class CommitterImpl implements Committer {
 
   @Override
   public void close(Collection<TopicPartition> closedPartitions) {
+    this.processCustomMetrics.unregisterProcessMBean();
+    this.pendingRecordCustomMetrics.unregisterPartitionMBean(closedPartitions);
+
     // Always try to stop the worker to avoid duplicates.
     stopWorker();
 
@@ -194,7 +215,14 @@ public class CommitterImpl implements Committer {
     if (null == this.worker) {
       LOG.info("Starting commit worker {}-{}", config.connectorName(), config.taskId());
       SinkWriter sinkWriter = new SinkWriter(catalog, config);
-      worker = new Worker(config, clientFactory, sinkWriter, context);
+      worker =
+          new Worker(
+              config,
+              clientFactory,
+              sinkWriter,
+              context,
+              processCustomMetrics,
+              pendingRecordCustomMetrics);
       worker.start();
     }
   }

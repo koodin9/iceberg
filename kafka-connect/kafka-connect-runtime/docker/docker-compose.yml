@@ -85,6 +85,8 @@ services:
     depends_on:
       - kafka
     hostname: connect
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - 8083:8083
     volumes:

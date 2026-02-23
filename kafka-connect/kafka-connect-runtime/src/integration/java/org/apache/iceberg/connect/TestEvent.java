@@ -36,7 +36,7 @@ import org.apache.kafka.connect.json.JsonConverter;
 import org.apache.kafka.connect.storage.ConverterConfig;
 import org.apache.kafka.connect.storage.ConverterType;
 
-public class TestEvent {
+public class TestEvent implements TestEventBase {
 
   public static final Schema TEST_SCHEMA =
       new Schema(
@@ -83,11 +83,13 @@ public class TestEvent {
     this.op = op;
   }
 
+  @Override
   public long id() {
     return id;
   }
 
-  protected String serialize(boolean useSchema) {
+  @Override
+  public String serialize(boolean useSchema) {
     try {
       Struct value =
           new Struct(TEST_CONNECT_SCHEMA)
@@ -104,10 +106,15 @@ public class TestEvent {
               .hiddenImpl(
                   JsonConverter.class, org.apache.kafka.connect.data.Schema.class, Object.class)
               .build(JSON_CONVERTER)
-              .invoke(TestEvent.TEST_CONNECT_SCHEMA, value);
+              .invoke(TEST_CONNECT_SCHEMA, value);
       return TestContext.MAPPER.writeValueAsString(json);
     } catch (JsonProcessingException e) {
       throw new RuntimeException(e);
     }
+  }
+
+  @Override
+  public Struct header() {
+    return null;
   }
 }

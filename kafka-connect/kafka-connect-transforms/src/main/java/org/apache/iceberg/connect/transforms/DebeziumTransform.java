@@ -28,6 +28,7 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.transforms.Transformation;
 import org.apache.kafka.connect.transforms.util.Requirements;
@@ -43,6 +44,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
   private static final String CDC_TARGET_PATTERN = "cdc.target.pattern";
   private static final String DB_PLACEHOLDER = "{db}";
   private static final String TABLE_PLACEHOLDER = "{table}";
+  private static final String DDL_CHECK_KEY = "is_ddl";
 
   public static final ConfigDef CONFIG_DEF =
       new ConfigDef()
@@ -68,15 +70,38 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     } else if (record.valueSchema() == null) {
       return applySchemaless(record);
     } else {
+      if (isDDLMessage(record)) {
+        LOG.info("[DDL connector] record is DDL message");
+        return record;
+      }
       return applyWithSchema(record);
     }
+  }
+
+  public boolean isDDLMessage(R record) {
+    for (Header header : record.headers()) {
+      if (header.key().equals(DDL_CHECK_KEY)) {
+        return header.value().toString().equalsIgnoreCase("true");
+      }
+    }
+
+    return false;
   }
 
   @SuppressWarnings("JavaUtilDate")
   private R applyWithSchema(R record) {
     Struct value = Requirements.requireStruct(record.value(), "Debezium transform");
 
-    String op = mapOperation(value.get("op").toString());
+    Object opValue = value.get("op");
+    if (opValue == null) {
+      LOG.error(
+          "[DDL connector] Record has no 'op' field. Schema fields: {}, Value: {}",
+          value.schema().fields(),
+          value);
+      throw new IllegalStateException(
+          "Record has no 'op' field - this may be a DDL message that wasn't filtered");
+    }
+    String op = mapOperation(opValue.toString());
 
     Struct payload;
     Schema payloadSchema;
@@ -87,6 +112,9 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
       payload = value.getStruct("after");
       payloadSchema = value.schema().field("after").schema();
     }
+
+    Struct source = value.getStruct("source");
+    Schema sourceSchema = value.schema().field("source").schema();
 
     // create the CDC metadata
     Schema cdcSchema = makeCdcSchema(record.keySchema());
@@ -103,12 +131,15 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     }
 
     // create the new value
-    Schema newValueSchema = makeUpdatedSchema(payloadSchema, cdcSchema);
+    Schema newValueSchema = makeUpdatedSchema(payloadSchema, cdcSchema, sourceSchema);
     Struct newValue = new Struct(newValueSchema);
 
     for (Field field : payloadSchema.fields()) {
       newValue.put(field.name(), payload.get(field));
     }
+
+    newValue.put("$__source", source);
+
     newValue.put(CdcConstants.COL_CDC, cdcMetadata);
 
     return record.newRecord(
@@ -155,6 +186,10 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     // create the new value
     Map<String, Object> newValue = Maps.newHashMap((Map<String, Object>) payload);
     newValue.put(CdcConstants.COL_CDC, cdcMetadata);
+
+    // Add source metadata as $__source (same as applyWithSchema)
+    // TODO: source field가 쓰이는 곳이 없기 때문에 없애는 것도 검토 필요
+    newValue.put("$__source", value.get("source"));
 
     return record.newRecord(
         record.topic(),
@@ -230,7 +265,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     return builder.build();
   }
 
-  private Schema makeUpdatedSchema(Schema schema, Schema cdcSchema) {
+  private Schema makeUpdatedSchema(Schema schema, Schema cdcSchema, Schema sourceSchema) {
     SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());
 
     for (Field field : schema.fields()) {
@@ -238,6 +273,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     }
 
     builder.field(CdcConstants.COL_CDC, cdcSchema);
+    builder.field("$__source", sourceSchema);
 
     return builder.build();
   }

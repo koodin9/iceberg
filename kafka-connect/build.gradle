@@ -32,6 +32,12 @@ project(':iceberg-kafka-connect:iceberg-kafka-connect-events') {
 }
 
 project(':iceberg-kafka-connect:iceberg-kafka-connect') {
+  configurations {
+    all {
+      exclude group: 'javax.activation', module: 'activation'
+    }
+  }
+
   dependencies {
     api project(':iceberg-api')
     implementation project(':iceberg-core')
@@ -43,6 +49,10 @@ project(':iceberg-kafka-connect:iceberg-kafka-connect') {
     implementation libs.jackson.core
     implementation libs.jackson.databind
     implementation libs.avro.avro
+    implementation(libs.hadoop3.common) {
+      exclude group: 'org.apache.hadoop', module: 'hadoop-auth'
+    }
+    implementation libs.debezium
 
     compileOnly libs.kafka.clients
     compileOnly libs.kafka.connect.api
@@ -170,6 +180,7 @@ project(':iceberg-kafka-connect:iceberg-kafka-connect-runtime') {
     integrationImplementation project(':iceberg-api')
     integrationImplementation project(':iceberg-common')
     integrationImplementation project(':iceberg-core')
+    integrationImplementation project(':iceberg-data')
     integrationImplementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
     integrationImplementation platform(libs.jackson.bom)
     integrationImplementation libs.jackson.core
@@ -182,6 +193,14 @@ project(':iceberg-kafka-connect:iceberg-kafka-connect-runtime') {
     integrationImplementation libs.httpcomponents.httpclient5
     integrationImplementation libs.awaitility
     integrationImplementation libs.analyticsaccelerator.s3
+    integrationImplementation(libs.hadoop3.client) {
+      exclude group: 'org.apache.avro', module: 'avro'
+      exclude group: 'org.slf4j', module: 'slf4j-log4j12'
+    }
+
+    // Jetty for test API server
+    testImplementation 'org.eclipse.jetty:jetty-server:11.0.18'
+    testImplementation 'org.eclipse.jetty:jetty-servlet:11.0.18'
   }
 
   task integrationTest(type: Test) {

@@ -1,0 +1,17 @@
+{
+  "translatedDDLs": [
+    {
+      "operation": "MODIFY_COLUMN",
+      "tableName": "cdc_test_table",
+      "columnName": "t_tmp",
+      "columnOldName": null,
+      "columnNewName": null,
+      "columnDetail": {
+        "type": "int",
+        "nullable": true,
+        "defaultValue": null
+      }
+    }
+  ],
+  "message": "DDL translation successful."
+}
