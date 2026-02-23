@@ -39,6 +39,7 @@ caffeine = "2.9.3"
 calcite = "1.40.0"
 comet = "0.8.1"
 datasketches = "6.2.0"
+debezium = "3.0.7.Final"
 delta-standalone = "3.3.2"
 delta-spark = "3.3.2"
 derby = "10.15.2.0"
@@ -109,6 +110,7 @@ caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "c
 calcite-core = { module = "org.apache.calcite:calcite-core", version.ref = "calcite" }
 calcite-druid = { module = "org.apache.calcite:calcite-druid", version.ref = "calcite" }
 datasketches = { module = "org.apache.datasketches:datasketches-java", version.ref = "datasketches" }
+debezium = { module = "io.debezium:debezium-core", version.ref = "debezium" }
 delta-standalone = { module = "io.delta:delta-standalone_2.12", version.ref = "delta-standalone" }
 errorprone-annotations = { module = "com.google.errorprone:error_prone_annotations", version.ref = "errorprone-annotations" }
 failsafe = { module = "dev.failsafe:failsafe", version.ref = "failsafe"}

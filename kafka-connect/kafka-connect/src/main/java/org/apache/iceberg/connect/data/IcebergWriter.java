@@ -19,6 +19,8 @@
 package org.apache.iceberg.connect.data;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.List;
@@ -64,17 +66,24 @@ class IcebergWriter implements RecordWriter {
         writer.write(row);
       }
     } catch (Exception e) {
+      StringWriter sw = new StringWriter();
+      e.printStackTrace(new PrintWriter(sw));
       throw new DataException(
           String.format(
               Locale.ROOT,
-              "An error occurred converting record, topic: %s, partition, %d, offset: %d",
+              "An error occurred converting record, topic: %s, partition: %d, offset: %d, headers: %s, valueSchema: %s, record: %s%nRoot cause stack trace:%n%s",
               record.topic(),
               record.kafkaPartition(),
-              record.kafkaOffset()),
+              record.kafkaOffset(),
+              record.headers(),
+              record.valueSchema(),
+              record.value(),
+              sw),
           e);
     }
   }
 
+  // 여기서 convert에 실패하면 DDL 버전이 다르다는 것을 의미
   private Record convertToRow(SinkRecord record) {
     if (!config.evolveSchemaEnabled()) {
       return recordConverter.convert(record.value());

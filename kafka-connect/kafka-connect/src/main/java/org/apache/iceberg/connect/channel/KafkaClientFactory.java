@@ -50,9 +50,9 @@ class KafkaClientFactory {
     return result;
   }
 
-  Consumer<String, byte[]> createConsumer(String consumerGroupId) {
+  public Consumer<String, byte[]> createConsumer(String consumerGroupId, String autoOffsetReset) {
     Map<String, Object> consumerProps = Maps.newHashMap(kafkaProps);
-    consumerProps.putIfAbsent(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+    consumerProps.putIfAbsent(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, autoOffsetReset);
     consumerProps.putIfAbsent(ConsumerConfig.CLIENT_ID_CONFIG, UUID.randomUUID().toString());
     consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
     consumerProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");

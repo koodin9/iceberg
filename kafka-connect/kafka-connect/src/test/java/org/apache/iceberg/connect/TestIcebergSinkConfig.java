@@ -20,10 +20,12 @@ package org.apache.iceberg.connect;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.config.ConfigException;
 import org.junit.jupiter.api.Test;
 
@@ -109,5 +111,39 @@ public class TestIcebergSinkConfig {
 
     result = IcebergSinkConfig.checkClassName("org.apache.kafka.clients.producer.KafkaProducer");
     assertThat(result).isFalse();
+  }
+
+  @Test
+  public void testHadoopConfigDir() {
+    String cluster = "hadoop-cluster";
+    Map<String, String> props = Maps.newHashMap();
+    props.put("iceberg.catalog.type", "rest");
+    props.put("iceberg.hadoop-cluster-name", "hadoop-cluster");
+    props.put("iceberg.tables", "db.landing");
+
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertNull(config.hadoopConfDir());
+
+    // hadoop-conf-dir 전달시 해당 값 그대로 리턴
+    String customDir = "/path/to/hadoop-weird/hadoop/conf";
+    props.put("iceberg.hadoop-conf-dir", customDir);
+    config = new IcebergSinkConfig(props);
+    assertThat(config.hadoopConfDir()).isEqualTo(customDir);
+  }
+
+  @Test
+  public void testTimezoneConverter() {
+    Map<String, String> props = Maps.newHashMap();
+    props.put("iceberg.catalog.type", "rest");
+    props.put("iceberg.tables", "db.landing");
+    props.put("transforms", "convertTimezone,debezium");
+
+    assertThatThrownBy(() -> new IcebergSinkConfig(props))
+        .isInstanceOf(ConfigException.class)
+        .hasMessage("Must specify a timezone");
+
+    props.put("transforms.convertTimezone.converted.timezone", "UTC");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.convertTimezone()).isNotEmpty();
   }
 }

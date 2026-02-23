@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.connect.data;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -29,7 +31,13 @@ import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DeleteFiles;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.UpdateSchema;
 import org.apache.iceberg.connect.IcebergSinkConfig;
@@ -60,27 +68,45 @@ import org.apache.iceberg.util.Tasks;
 import org.apache.kafka.connect.data.Date;
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Time;
 import org.apache.kafka.connect.data.Timestamp;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-class SchemaUtils {
+public class SchemaUtils {
 
   private static final Logger LOG = LoggerFactory.getLogger(SchemaUtils.class);
 
   private static final Pattern TRANSFORM_REGEX = Pattern.compile("(\\w+)\\((.+)\\)");
 
+  private static final String DATETIME_LOGICAL_NAME = "org.apache.iceberg.connect.datetime";
+
   static PrimitiveType needsDataTypeUpdate(Type currentIcebergType, Schema valueSchema) {
+    return needsDataTypeUpdate(currentIcebergType, valueSchema, false);
+  }
+
+  static PrimitiveType needsDataTypeUpdate(
+      Type currentIcebergType, Schema valueSchema, boolean forDdlOperation) {
+    // STRING case is only needed for DDL modify column operations
+    // For schema evolution, STRING -> STRING doesn't require any update
+    if (forDdlOperation
+        && currentIcebergType.typeId() == TypeID.STRING
+        && valueSchema.type() == Schema.Type.STRING) {
+      return StringType.get();
+    }
+    // Type widening: FLOAT -> DOUBLE
     if (currentIcebergType.typeId() == TypeID.FLOAT && valueSchema.type() == Schema.Type.FLOAT64) {
       return DoubleType.get();
     }
+    // Type widening: INTEGER -> LONG
     if (currentIcebergType.typeId() == TypeID.INTEGER && valueSchema.type() == Schema.Type.INT64) {
       return LongType.get();
     }
     return null;
   }
 
+  // 여기서 이전 스키마 정보가 들어온다면, commitSchemaUpdates를 하지 않고 스킵, 그렇지 않다면 commitSchemaUpdates를 실행한다.
   static void applySchemaUpdates(Table table, SchemaUpdate.Consumer updates) {
     if (updates == null || updates.empty()) {
       // no updates to apply
@@ -228,6 +254,12 @@ class SchemaUtils {
 
     @SuppressWarnings("checkstyle:CyclomaticComplexity")
     Type toIcebergType(Schema valueSchema) {
+      LOG.info(
+          "[DDL connector] Converting Kafka Connect schema to Iceberg type. valueSchema: {}, type: {}, name: {}",
+          valueSchema,
+          valueSchema.type(),
+          valueSchema.name());
+
       switch (valueSchema.type()) {
         case BOOLEAN:
           return BooleanType.get();
@@ -248,8 +280,12 @@ class SchemaUtils {
           }
           return IntegerType.get();
         case INT64:
-          if (Timestamp.LOGICAL_NAME.equals(valueSchema.name())) {
-            return TimestampType.withZone();
+          if (valueSchema.name() != null) {
+            if (valueSchema.name().equals(Timestamp.LOGICAL_NAME)) {
+              return TimestampType.withZone();
+            } else if (valueSchema.name().equals(DATETIME_LOGICAL_NAME)) {
+              return TimestampType.withoutZone();
+            }
           }
           return LongType.get();
         case FLOAT32:
@@ -347,6 +383,84 @@ class SchemaUtils {
     private int nextId() {
       return fieldId++;
     }
+  }
+
+  public static void truncateTable(Table table, DeleteFiles delete, String branch) {
+    Snapshot snapshot = branch != null ? table.snapshot(branch) : table.currentSnapshot();
+    if (snapshot == null) {
+      // 테이블에 데이터가 없으면 truncate할 것이 없음
+      LOG.info(
+          "[DDL connector] Table {} has no data to truncate (no snapshots on branch: {})",
+          table.name(),
+          branch);
+      return;
+    }
+
+    for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+      try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io())) {
+        reader.forEach(delete::deleteFile);
+      } catch (IOException e) {
+        throw new UncheckedIOException("Failed to read manifest file: " + manifest.path(), e);
+      }
+    }
+    LOG.info("[DDL connector] Truncated table {} on branch {}", table.name(), branch);
+  }
+
+  public static void renameColumn(UpdateSchema update, String oldColumnName, String newColumnName) {
+    update.renameColumn(oldColumnName, newColumnName);
+    LOG.info("[DDL connector] Renaming column {} to {}", oldColumnName, newColumnName);
+  }
+
+  public static void dropColumn(UpdateSchema update, String columnName) {
+    update.deleteColumn(columnName);
+    LOG.info("[DDL connector] Dropping column {}", columnName);
+  }
+
+  public static void addColumn(
+      UpdateSchema update, String newColumnName, String newColumnType, IcebergSinkConfig config) {
+    Schema schema = mapColumnTypeToSchema(newColumnType);
+    update.addColumn(newColumnName, toIcebergType(schema, config));
+    LOG.info(
+        "[DDL connector] Adding column {} with schema {}, columnDataType {}, toIcebergType {}",
+        newColumnName,
+        schema,
+        newColumnType,
+        toIcebergType(schema, config));
+  }
+
+  public static void modifyColumn(
+      UpdateSchema update, String columnName, Type currentType, String newColumnType) {
+    Schema schema = mapColumnTypeToSchema(newColumnType);
+    update.updateColumn(columnName, needsDataTypeUpdate(currentType, schema, true));
+    LOG.info(
+        "[DDL connector] Modifying column {} with schema {}, needsDataTypeUpdate {}",
+        columnName,
+        schema,
+        needsDataTypeUpdate(currentType, schema, true));
+  }
+
+  public static Schema mapColumnTypeToSchema(String columnType) {
+    String dataType = columnType.toLowerCase();
+    LOG.info("[DDL connector] mapColumnTypeToSchema Column data type: {}", dataType);
+
+    if (dataType.contains("varchar")
+        || dataType.equals("char")
+        || dataType.equals("text")
+        || dataType.equals("enum")
+        || dataType.equals("string")) {
+      return Schema.STRING_SCHEMA;
+    }
+    return switch (dataType) {
+      case "int", "integer" -> Schema.INT32_SCHEMA;
+      case "bigint", "long" -> Schema.INT64_SCHEMA;
+      case "timestamp" -> SchemaBuilder.int64().name(DATETIME_LOGICAL_NAME).build();
+      case "boolean" -> Schema.BOOLEAN_SCHEMA;
+      case "double", "float" -> Schema.FLOAT64_SCHEMA;
+      case "decimal" -> Schema.FLOAT32_SCHEMA;
+      case "timestamptz" -> Timestamp.SCHEMA;
+      case "date" -> Schema.OPTIONAL_STRING_SCHEMA; // Customize as needed
+      default -> throw new IllegalArgumentException("Unsupported SQL type: " + dataType);
+    };
   }
 
   private SchemaUtils() {}

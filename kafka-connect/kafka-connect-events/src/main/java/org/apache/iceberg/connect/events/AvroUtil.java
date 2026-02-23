@@ -48,7 +48,9 @@ public class AvroUtil {
           DataWritten.DELETE_FILES_ELEMENT,
           "org.apache.iceberg.GenericDeleteFile",
           CommitToTable.TABLE_REFERENCE,
-          TableReference.class.getName());
+          TableReference.class.getName(),
+          DDLReady.LAST_DML_INFO_ELEMENT,
+          LastDMLInfo.class.getName());
 
   public static byte[] encode(Event event) {
     try {

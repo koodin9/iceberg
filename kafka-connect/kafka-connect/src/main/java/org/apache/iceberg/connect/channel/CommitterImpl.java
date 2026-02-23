@@ -18,18 +18,22 @@
  */
 package org.apache.iceberg.connect.channel;
 
+import java.lang.management.ManagementFactory;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.management.MBeanServer;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.connect.Committer;
 import org.apache.iceberg.connect.IcebergSinkConfig;
 import org.apache.iceberg.connect.data.SinkWriter;
+import org.apache.iceberg.connect.metrics.MBeanRegisterFactory;
+import org.apache.iceberg.connect.metrics.PendingRecordCustomMetrics;
+import org.apache.iceberg.connect.metrics.ProcessCustomMetrics;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.MemberDescription;
-import org.apache.kafka.common.ConsumerGroupState;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -48,6 +52,8 @@ public class CommitterImpl implements Committer {
   private SinkTaskContext context;
   private KafkaClientFactory clientFactory;
   private Collection<MemberDescription> membersWhenWorkerIsCoordinator;
+  private ProcessCustomMetrics processCustomMetrics;
+  private PendingRecordCustomMetrics pendingRecordCustomMetrics;
   private final AtomicBoolean isInitialized = new AtomicBoolean(false);
 
   private void initialize(
@@ -74,18 +80,19 @@ public class CommitterImpl implements Committer {
     }
   }
 
-  private boolean hasLeaderPartition(Collection<TopicPartition> currentAssignedPartitions) {
+  @VisibleForTesting
+  boolean hasLeaderPartition(Collection<TopicPartition> currentAssignedPartitions) {
     ConsumerGroupDescription groupDesc;
     try (Admin admin = clientFactory.createAdmin()) {
       groupDesc = KafkaUtils.consumerGroupDescription(config.connectGroupId(), admin);
     }
-    if (groupDesc.state() == ConsumerGroupState.STABLE) {
-      Collection<MemberDescription> members = groupDesc.members();
-      if (containsFirstPartition(members, currentAssignedPartitions)) {
-        membersWhenWorkerIsCoordinator = members;
-        return true;
-      }
+
+    Collection<MemberDescription> members = groupDesc.members();
+    if (containsFirstPartition(members, currentAssignedPartitions)) {
+      membersWhenWorkerIsCoordinator = members;
+      return true;
     }
+
     return false;
   }
 
@@ -121,6 +128,17 @@ public class CommitterImpl implements Committer {
       SinkTaskContext sinkTaskContext,
       Collection<TopicPartition> addedPartitions) {
     initialize(icebergCatalog, icebergSinkConfig, sinkTaskContext);
+
+    MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+    String connectorName = context.configs().get("name");
+
+    processCustomMetrics =
+        MBeanRegisterFactory.initializeProcessLatencyMBeans(mBeanServer, connectorName);
+    processCustomMetrics.registerProcessMBean();
+
+    pendingRecordCustomMetrics =
+        MBeanRegisterFactory.initializePendingRecordMBeans(mBeanServer, connectorName);
+    pendingRecordCustomMetrics.registerPartitionMBean(addedPartitions);
     if (hasLeaderPartition(addedPartitions)) {
       LOG.info("Committer received leader partition. Starting Coordinator.");
       startCoordinator();
@@ -136,19 +154,35 @@ public class CommitterImpl implements Committer {
 
   @Override
   public void close(Collection<TopicPartition> closedPartitions) {
+    this.processCustomMetrics.unregisterProcessMBean();
+    this.pendingRecordCustomMetrics.unregisterPartitionMBean(closedPartitions);
+
+    // Always try to stop the worker to avoid duplicates.
+    stopWorker();
+
+    // Defensive: close called without prior initialization (should not happen).
     if (!isInitialized.get()) {
-      LOG.warn("Unexpected close() call without resource initialization");
+      LOG.warn("Close unexpectedly called without partition assignment");
       return;
     }
+
+    // Empty partitions → task was stopped explicitly. Stop coordinator if running.
+    if (closedPartitions.isEmpty()) {
+      LOG.info("Task stopped. Closing coordinator.");
+      stopCoordinator();
+      return;
+    }
+
+    // Normal close: if leader partition is lost, stop coordinator.
     if (hasLeaderPartition(closedPartitions)) {
       LOG.info(
-          "Committer {}-{} lost leader partition. Stopping Coordinator.",
+          "Committer {}-{} lost leader partition. Stopping coordinator.",
           config.connectorName(),
           config.taskId());
       stopCoordinator();
     }
-    LOG.info("Stopping worker {}-{}.", config.connectorName(), config.taskId());
-    stopWorker();
+
+    // Reset offsets to last committed to avoid data loss.
     LOG.info(
         "Seeking to last committed offsets for worker {}-{}.",
         config.connectorName(),
@@ -167,7 +201,10 @@ public class CommitterImpl implements Committer {
 
   private void processControlEvents() {
     if (coordinatorThread != null && coordinatorThread.isTerminated()) {
-      throw new NotRunningException("Coordinator unexpectedly terminated");
+      throw new NotRunningException(
+          String.format(
+              "Coordinator unexpectedly terminated on committer %s-%s",
+              config.connectorName(), config.taskId()));
     }
     if (worker != null) {
       worker.process();
@@ -176,16 +213,26 @@ public class CommitterImpl implements Committer {
 
   private void startWorker() {
     if (null == this.worker) {
-      LOG.info("Starting commit worker");
+      LOG.info("Starting commit worker {}-{}", config.connectorName(), config.taskId());
       SinkWriter sinkWriter = new SinkWriter(catalog, config);
-      worker = new Worker(config, clientFactory, sinkWriter, context);
+      worker =
+          new Worker(
+              config,
+              clientFactory,
+              sinkWriter,
+              context,
+              processCustomMetrics,
+              pendingRecordCustomMetrics);
       worker.start();
     }
   }
 
   private void startCoordinator() {
     if (null == this.coordinatorThread) {
-      LOG.info("Task elected leader, starting commit coordinator");
+      LOG.info(
+          "Task {}-{} elected leader, starting commit coordinator",
+          config.connectorName(),
+          config.taskId());
       Coordinator coordinator =
           new Coordinator(catalog, config, membersWhenWorkerIsCoordinator, clientFactory, context);
       coordinatorThread = new CoordinatorThread(coordinator);

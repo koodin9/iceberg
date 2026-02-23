@@ -22,10 +22,14 @@ import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
+import java.security.PrivilegedExceptionAction;
 import java.util.Collection;
 import java.util.Collections;
 import org.apache.iceberg.Schema;
@@ -35,6 +39,9 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.IcebergSinkConfig;
 import org.apache.iceberg.connect.MockIcebergSinkTask;
 import org.apache.iceberg.connect.TableSinkConfig;
+import org.apache.iceberg.connect.auth.KerberosAuthManager;
+import org.apache.iceberg.connect.cmdb.CmdbManager;
+import org.apache.iceberg.connect.cmdb.CmdbManagerFactory;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -53,6 +60,7 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.mockito.MockedStatic;
 
 public class ChannelTestBase {
   protected static final String SRC_TOPIC_NAME = "src-topic";
@@ -67,6 +75,12 @@ public class ChannelTestBase {
   protected MockConsumer<String, byte[]> sourceConsumer;
   protected MockIcebergSinkTask mockIcebergSinkTask;
   protected Admin admin;
+  private final MockedStatic<CmdbManagerFactory> mockCmdbManagerFactory =
+      mockStatic(CmdbManagerFactory.class);
+  private final MockedStatic<KerberosAuthManager> mockKerberosAuthManager =
+      mockStatic(KerberosAuthManager.class);
+  protected CmdbManager mockCmdbManager = mock(CmdbManager.class);
+  protected KerberosAuthManager mockAuthManager = mock(KerberosAuthManager.class);
 
   private InMemoryCatalog initInMemoryCatalog() {
     InMemoryCatalog inMemoryCatalog = new InMemoryCatalog();
@@ -92,7 +106,7 @@ public class ChannelTestBase {
   @BeforeEach
   @SuppressWarnings("deprecation")
   public void before() {
-    catalog = initInMemoryCatalog();
+    catalog = spy(initInMemoryCatalog());
     catalog.createNamespace(NAMESPACE);
     table = catalog.createTable(TABLE_IDENTIFIER, SCHEMA);
 
@@ -121,13 +135,41 @@ public class ChannelTestBase {
     sourceConsumer.subscribe(Collections.singleton(SRC_TOPIC_NAME), new Listener());
     clientFactory = mock(KafkaClientFactory.class);
     when(clientFactory.createProducer(any())).thenReturn(producer);
-    when(clientFactory.createConsumer(any())).thenReturn(consumer);
+    when(clientFactory.createConsumer(any(), any())).thenReturn(consumer);
     when(clientFactory.createAdmin()).thenReturn(admin);
+
+    when(config.tables()).thenReturn(ImmutableList.of("test_schema.test_table"));
+    when(config.cmdbApiUrl()).thenReturn("http://hello:8080");
+    when(config.cmdbApiToken()).thenReturn("hello!");
+    when(config.hadoopClusterName()).thenReturn("hadoop-test");
+    when(config.topics()).thenReturn(SRC_TOPIC_NAME);
+    when(config.connectAdminUrl()).thenReturn("http://lintan-connect-admin.test.net");
+    when(config.transforms()).thenReturn("debezium");
+
+    mockCmdbManagerFactory
+        .when(() -> CmdbManagerFactory.getInstance(any()))
+        .thenReturn(mockCmdbManager);
+    when(mockCmdbManager.getLatestDdlVersion()).thenReturn(CmdbManager.UNDEFINED_DDL_VERSION);
+
+    mockKerberosAuthManager
+        .when(() -> KerberosAuthManager.getInstance(any()))
+        .thenReturn(mockAuthManager);
+
+    doAnswer(
+            invocation -> {
+              PrivilegedExceptionAction<?> action = invocation.getArgument(0);
+              action.run();
+              return null;
+            })
+        .when(mockAuthManager)
+        .executeWithAuth(any());
   }
 
   @AfterEach
   public void after() throws IOException {
     catalog.close();
+    mockCmdbManagerFactory.close();
+    mockKerberosAuthManager.close();
   }
 
   protected void initConsumer() {

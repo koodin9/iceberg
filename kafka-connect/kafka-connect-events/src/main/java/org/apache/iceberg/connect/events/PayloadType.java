@@ -29,7 +29,11 @@ public enum PayloadType {
   /** Maps to payload of type {@link CommitToTable} */
   COMMIT_TO_TABLE(3),
   /** Maps to payload of type {@link CommitComplete} */
-  COMMIT_COMPLETE(4);
+  COMMIT_COMPLETE(4),
+  /** Maps to payload of type {@link DDLReady} */
+  DDL_READY(5),
+  /** Maps to payload of type {@link DDLComplete} */
+  DDL_COMPLETE(6);
 
   private final int id;
 

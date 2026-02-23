@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.connect.IcebergSinkConfig;
+import org.apache.iceberg.connect.events.DDLReady;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.TableReference;
@@ -38,6 +39,7 @@ class CommitState {
 
   private final List<Envelope> commitBuffer = Lists.newArrayList();
   private final List<DataComplete> readyBuffer = Lists.newArrayList();
+  private final List<DDLReady> ddlBuffer = Lists.newArrayList();
   private long startTime;
   private UUID currentCommitId;
   private final IcebergSinkConfig config;
@@ -64,6 +66,20 @@ class CommitState {
           "Received commit ready when no commit in progress, this can happen during recovery. Commit ID: {}",
           dataComplete.commitId());
     }
+  }
+
+  public void addDDL(Envelope envelope) {
+    ddlBuffer.add((DDLReady) envelope.event().payload());
+    if (!isCommitInProgress()) {
+      LOG.debug(
+          "[DDL connector] Received DDL Message for ddl_version={} when no commit in progress, this can happen during recovery",
+          ((DDLReady) envelope.event().payload()).ddlVersion());
+    }
+  }
+
+  public void replaceDDLBuffer(List<DDLReady> newDdlList) {
+    ddlBuffer.clear();
+    ddlBuffer.addAll(newDdlList);
   }
 
   UUID currentCommitId() {
@@ -135,6 +151,23 @@ class CommitState {
         expectedPartitionCount);
 
     return false;
+  }
+
+  public List<DDLReady> ddlBuffer() {
+    // return ddlBuffer sorted by ddlVersion
+    ddlBuffer.sort(Comparator.comparing(DDLReady::ddlVersion));
+    ddlBuffer.forEach(
+        ddl ->
+            LOG.debug(
+                "[DDL connector] DDL buffer ddl: {}, ddl_version: {}, " + "lastDmlInfo: {}",
+                ddl.ddl(),
+                ddl.ddlVersion(),
+                ddl.lastDMLInfoList()));
+    return ddlBuffer;
+  }
+
+  public DDLReady popDDL() {
+    return ddlBuffer.remove(0);
   }
 
   Map<TableReference, List<Envelope>> tableCommitMap() {

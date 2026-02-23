@@ -56,6 +56,25 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String ID_COLUMNS = "id-columns";
   private static final String PARTITION_BY = "partition-by";
   private static final String COMMIT_BRANCH = "commit-branch";
+  private static final String TOPICS = "topics";
+
+  private static final String HDFS_AUTHENTICATION_KERBEROS_PROP =
+      "iceberg.hdfs.authentication.kerberos";
+  private static final String CONNECT_ADMIN_URL_PROP = "connect.admin.url";
+  private static final String CMDB_API_URL_PROP = "cmdb.api.url";
+  private static final String CMDB_API_TOKEN_PROP = "cmdb.api.token";
+  private static final String KAKAO_CDC_ENABLED_PROP = "iceberg.kakao.cdc.enabled";
+  private static final Boolean KAKAO_CDC_ENABLED_DEFAULT = true;
+  private static final Boolean HDFS_AUTHENTICATION_KERBEROS_DEFAULT = false;
+  private static final String CONNECT_HDFS_PRINCIPAL_PROP = "iceberg.connect.hdfs.principal";
+  private static final String CONNECT_HDFS_PRINCIPAL_DEFAULT = "";
+  private static final String CONNECT_HDFS_KEYTAB_PROP = "iceberg.connect.hdfs.keytab";
+  private static final String CONNECT_HDFS_KEYTAB_DEFAULT = "";
+  private static final String CONNECT_HDFS_IMPERSONATE_PROP = "iceberg.connect.hdfs.impersonate";
+  private static final String CONNECT_HDFS_IMPERSONATE_DEFAULT = "";
+  private static final String KERBEROS_TICKET_RENEW_PERIOD_MINUTE_PROP =
+      "kerberos.ticket.renew.period.minute";
+  private static final long KERBEROS_TICKET_RENEW_PERIOD_MINUTE_DEFAULT = 720;
 
   private static final String CATALOG_PROP_PREFIX = "iceberg.catalog.";
   private static final String HADOOP_PROP_PREFIX = "iceberg.hadoop.";
@@ -68,6 +87,9 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_PROP = "iceberg.tables";
   private static final String TABLES_DYNAMIC_PROP = "iceberg.tables.dynamic-enabled";
   private static final String TABLES_ROUTE_FIELD_PROP = "iceberg.tables.route-field";
+  private static final String TABLES_CDC_FIELD_PROP = "iceberg.tables.cdc-field";
+  private static final String TABLES_UPSERT_MODE_ENABLED_PROP =
+      "iceberg.tables.upsert-mode-enabled";
   private static final String TABLES_DEFAULT_COMMIT_BRANCH = "iceberg.tables.default-commit-branch";
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
@@ -79,6 +101,10 @@ public class IcebergSinkConfig extends AbstractConfig {
       "iceberg.tables.schema-force-optional";
   private static final String TABLES_SCHEMA_CASE_INSENSITIVE_PROP =
       "iceberg.tables.schema-case-insensitive";
+  private static final String TRANSFORM_PROP = "transforms";
+  private static final String TRANSFORM_CONVERT_TIMEZONE_PROP =
+      "transforms.convertTimezone.converted.timezone";
+
   private static final String CONTROL_TOPIC_PROP = "iceberg.control.topic";
   private static final String CONTROL_GROUP_ID_PREFIX_PROP = "iceberg.control.group-id-prefix";
   private static final String COMMIT_INTERVAL_MS_PROP = "iceberg.control.commit.interval-ms";
@@ -90,6 +116,9 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TRANSACTIONAL_PREFIX_PROP =
       "iceberg.coordinator.transactional.prefix";
   private static final String HADOOP_CONF_DIR_PROP = "iceberg.hadoop-conf-dir";
+  private static final String HADOOP_CLUSTER_NAME = "iceberg.hadoop-cluster-name";
+
+  public static final String TIMEZONE_SMT_NAME = "convertTimezone";
 
   private static final String NAME_PROP = "name";
   private static final String TASK_ID = "task.id";
@@ -98,6 +127,9 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String DEFAULT_CATALOG_NAME = "iceberg";
   private static final String DEFAULT_CONTROL_TOPIC = "control-iceberg";
   public static final String DEFAULT_CONTROL_GROUP_PREFIX = "cg-control-";
+  public static final String DEFAULT_HADOOP_CONF_DIR_PREFIX =
+      "/opt/kafka/hadoop-client-env-v2/target/";
+  public static final String DEFAULT_HADOOP_CONF_DIR_POSTFIX = "/config/hadoop";
 
   public static final int SCHEMA_UPDATE_RETRIES = 2; // 3 total attempts
   public static final int CREATE_TABLE_RETRIES = 2; // 3 total attempts
@@ -113,6 +145,7 @@ public class IcebergSinkConfig extends AbstractConfig {
     return IcebergBuild.version();
   }
 
+  @SuppressWarnings("checkstyle:MethodLength")
   private static ConfigDef newConfigDef() {
     ConfigDef configDef = new ConfigDef();
     configDef.define(
@@ -133,6 +166,18 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Source record field for routing records to tables");
+    configDef.define(
+        TABLES_CDC_FIELD_PROP,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "Source record field that identifies the type of operation (insert, update, or delete)");
+    configDef.define(
+        TABLES_UPSERT_MODE_ENABLED_PROP,
+        ConfigDef.Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Set to true to treat all appends as upserts, false otherwise");
     configDef.define(
         TABLES_DEFAULT_COMMIT_BRANCH,
         ConfigDef.Type.STRING,
@@ -175,6 +220,62 @@ public class IcebergSinkConfig extends AbstractConfig {
         false,
         Importance.MEDIUM,
         "Set to true to add any missing record fields to the table schema, false otherwise");
+    configDef.define(
+        CONNECT_ADMIN_URL_PROP,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.HIGH,
+        "URL to the DDL translator service");
+    configDef.define(
+        CMDB_API_URL_PROP, ConfigDef.Type.STRING, null, Importance.HIGH, "CMDB API URL");
+    configDef.define(
+        CMDB_API_TOKEN_PROP,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.HIGH,
+        "Auth token for CMDB API");
+    configDef.define(
+        HADOOP_CLUSTER_NAME,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.HIGH,
+        "Hadoop cluster name for CMDB");
+    configDef.define(
+        TOPICS,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.HIGH,
+        "Comma-delimited list of topics to consume. In the ZeroETL project, only a single topic will be used.");
+    configDef.define(
+        HDFS_AUTHENTICATION_KERBEROS_PROP,
+        ConfigDef.Type.BOOLEAN,
+        HDFS_AUTHENTICATION_KERBEROS_DEFAULT,
+        Importance.HIGH,
+        "Configuration indicating whether HDFS is using Kerberos for authentication");
+    configDef.define(
+        CONNECT_HDFS_PRINCIPAL_PROP,
+        ConfigDef.Type.STRING,
+        CONNECT_HDFS_PRINCIPAL_DEFAULT,
+        Importance.HIGH,
+        "The principal name to load from the keytab for Kerberos authentication");
+    configDef.define(
+        CONNECT_HDFS_KEYTAB_PROP,
+        ConfigDef.Type.STRING,
+        CONNECT_HDFS_KEYTAB_DEFAULT,
+        Importance.HIGH,
+        "The path to the keytab file for the HDFS connector principal. This keytab file should only be readable by the connector user");
+    configDef.define(
+        CONNECT_HDFS_IMPERSONATE_PROP,
+        ConfigDef.Type.STRING,
+        CONNECT_HDFS_IMPERSONATE_DEFAULT,
+        Importance.HIGH,
+        "The user to impersonate when connecting to HDFS");
+    configDef.define(
+        KERBEROS_TICKET_RENEW_PERIOD_MINUTE_PROP,
+        ConfigDef.Type.LONG,
+        KERBEROS_TICKET_RENEW_PERIOD_MINUTE_DEFAULT,
+        Importance.LOW,
+        "The period in milliseconds to renew the Kerberos ticket");
     configDef.define(
         CATALOG_NAME_PROP,
         ConfigDef.Type.STRING,
@@ -235,6 +336,24 @@ public class IcebergSinkConfig extends AbstractConfig {
         120000L,
         Importance.LOW,
         "config to control coordinator executor keep alive time");
+    configDef.define(
+        KAKAO_CDC_ENABLED_PROP,
+        ConfigDef.Type.BOOLEAN,
+        KAKAO_CDC_ENABLED_DEFAULT,
+        Importance.HIGH,
+        "Enable Kakao CDC specific features");
+    configDef.define(
+        TRANSFORM_PROP,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "Comma-separated list of transformation aliases to apply to records.");
+    configDef.define(
+        TRANSFORM_CONVERT_TIMEZONE_PROP,
+        ConfigDef.Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "The target timezone for converting timestamp fields from UTC");
     return configDef;
   }
 
@@ -274,6 +393,12 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   private void validate() {
     checkState(!catalogProps().isEmpty(), "Must specify Iceberg catalog properties");
+
+    String transformsValue = transforms();
+    if (transformsValue != null && transformsValue.contains(TIMEZONE_SMT_NAME)) {
+      checkState(convertTimezone() != null, "Must specify a timezone");
+    }
+
     if (tables() != null) {
       checkState(!dynamicTablesEnabled(), "Cannot specify both static and dynamic table names");
     } else if (dynamicTablesEnabled()) {
@@ -355,6 +480,10 @@ public class IcebergSinkConfig extends AbstractConfig {
     return getLong(COORDINATOR_EXECUTOR_KEEP_ALIVE_TIMEOUT_MS);
   }
 
+  public boolean kakaoCdcEnabled() {
+    return getBoolean(KAKAO_CDC_ENABLED_PROP);
+  }
+
   public TableSinkConfig tableConfig(String tableName) {
     return tableConfigMap.computeIfAbsent(
         tableName,
@@ -407,12 +536,62 @@ public class IcebergSinkConfig extends AbstractConfig {
     return "connect-" + connectorName;
   }
 
+  public boolean kerberosAuthentication() {
+    return getBoolean(HDFS_AUTHENTICATION_KERBEROS_PROP);
+  }
+
+  public String connectHdfsPrincipal() {
+    return getString(CONNECT_HDFS_PRINCIPAL_PROP);
+  }
+
+  public String connectHdfsKeytab() {
+    return getString(CONNECT_HDFS_KEYTAB_PROP);
+  }
+
+  public String connectHdfsImpersonate() {
+    return getString(CONNECT_HDFS_IMPERSONATE_PROP);
+  }
+
+  public boolean connectHdfsImpersonateEnabled() {
+    return !connectHdfsImpersonate().isEmpty();
+  }
+
+  public long kerberosTicketRenewPeriodMinutes() {
+    return getLong(KERBEROS_TICKET_RENEW_PERIOD_MINUTE_PROP);
+  }
+
+  // ddl translator 와 알람메세지 발송 두가지 역할을 connect-admin 이 처리한다.
+  public String connectAdminUrl() {
+    // connect.admin.url
+    return getString(CONNECT_ADMIN_URL_PROP);
+  }
+
+  public String cmdbApiUrl() {
+    return getString(CMDB_API_URL_PROP);
+  }
+
+  public String cmdbApiToken() {
+    return getString(CMDB_API_TOKEN_PROP);
+  }
+
+  public String topics() {
+    return getString(TOPICS);
+  }
+
   public int commitIntervalMs() {
     return getInt(COMMIT_INTERVAL_MS_PROP);
   }
 
   public int commitTimeoutMs() {
     return getInt(COMMIT_TIMEOUT_MS_PROP);
+  }
+
+  public String tablesCdcField() {
+    return getString(TABLES_CDC_FIELD_PROP);
+  }
+
+  public boolean isUpsertMode() {
+    return getBoolean(TABLES_UPSERT_MODE_ENABLED_PROP);
   }
 
   public int commitThreads() {
@@ -430,6 +609,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public String hadoopConfDir() {
     return getString(HADOOP_CONF_DIR_PROP);
+  }
+
+  public String hadoopClusterName() {
+    return getString(HADOOP_CLUSTER_NAME);
   }
 
   public boolean autoCreateEnabled() {
@@ -450,6 +633,14 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public JsonConverter jsonConverter() {
     return jsonConverter;
+  }
+
+  public String transforms() {
+    return getString(TRANSFORM_PROP);
+  }
+
+  public String convertTimezone() {
+    return getString(TRANSFORM_CONVERT_TIMEZONE_PROP);
   }
 
   @VisibleForTesting

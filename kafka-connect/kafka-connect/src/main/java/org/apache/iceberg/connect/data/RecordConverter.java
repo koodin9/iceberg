@@ -441,6 +441,7 @@ class RecordConverter {
     throw new ConnectException("Cannot convert date: " + value);
   }
 
+  // 이 메서드에 전달되는 값은 epoch time 이 아님 - toMicrosecEpochTime() 사용 X
   @SuppressWarnings("JavaUtilDate")
   protected LocalTime convertTimeValue(Object value) {
     if (value instanceof Number) {
@@ -467,8 +468,8 @@ class RecordConverter {
   @SuppressWarnings("JavaUtilDate")
   private OffsetDateTime convertOffsetDateTime(Object value) {
     if (value instanceof Number) {
-      long millis = ((Number) value).longValue();
-      return DateTimeUtil.timestamptzFromMicros(millis * 1000);
+      long timestamp = ((Number) value).longValue();
+      return DateTimeUtil.timestamptzFromMicros(toMicrosecEpochTime(timestamp));
     } else if (value instanceof String) {
       return parseOffsetDateTime((String) value);
     } else if (value instanceof OffsetDateTime) {
@@ -476,7 +477,8 @@ class RecordConverter {
     } else if (value instanceof LocalDateTime) {
       return ((LocalDateTime) value).atOffset(ZoneOffset.UTC);
     } else if (value instanceof Date) {
-      return DateTimeUtil.timestamptzFromMicros(((Date) value).getTime() * 1000);
+      long timestamp = ((Date) value).getTime();
+      return DateTimeUtil.timestamptzFromMicros(toMicrosecEpochTime(timestamp));
     }
     throw new ConnectException(
         "Cannot convert timestamptz: " + value + ", type: " + value.getClass());
@@ -495,8 +497,8 @@ class RecordConverter {
   @SuppressWarnings("JavaUtilDate")
   private LocalDateTime convertLocalDateTime(Object value) {
     if (value instanceof Number) {
-      long millis = ((Number) value).longValue();
-      return DateTimeUtil.timestampFromMicros(millis * 1000);
+      long timestamp = ((Number) value).longValue();
+      return DateTimeUtil.timestampFromMicros(toMicrosecEpochTime(timestamp));
     } else if (value instanceof String) {
       return parseLocalDateTime((String) value);
     } else if (value instanceof LocalDateTime) {
@@ -504,10 +506,59 @@ class RecordConverter {
     } else if (value instanceof OffsetDateTime) {
       return ((OffsetDateTime) value).toLocalDateTime();
     } else if (value instanceof Date) {
-      return DateTimeUtil.timestampFromMicros(((Date) value).getTime() * 1000);
+      long timestamp = ((Date) value).getTime();
+      return DateTimeUtil.timestampFromMicros(toMicrosecEpochTime(timestamp));
     }
     throw new ConnectException(
         "Cannot convert timestamp: " + value + ", type: " + value.getClass());
+  }
+
+  private Long toMicrosecEpochTime(Long value) {
+    if (value <= 0) {
+      return value;
+    }
+
+    int digits = countDigits(value);
+
+    // 16자리 이하인 경우 16자리 맞춰서 리턴
+    if (digits <= 16) {
+      return value * pow10(16 - countDigits(value));
+    }
+
+    // 17자리 이상인 경우 절삭
+    long divisor = pow10(digits - 16);
+    // 잘려나가는 부분 확인
+    long remainder = value % divisor;
+    // 단순히 0으로 채워진 nanosecond 가 아닐 경우 예외 발생
+    if (remainder != 0) {
+      throw new IllegalArgumentException(
+          String.format(
+              Locale.ROOT,
+              "Value %d exceeds 16 digits and contains non-zero digits in excess portion",
+              value));
+    }
+
+    return value / divisor;
+  }
+
+  // 자리수 계산
+  private int countDigits(long value) {
+    int digits = 0;
+    long val = value;
+    while (val > 0) {
+      digits++;
+      val /= 10;
+    }
+    return digits;
+  }
+
+  // 10의 exponent 승 반환
+  private long pow10(int exponent) {
+    long result = 1L;
+    for (int i = 0; i < exponent; i++) {
+      result *= 10;
+    }
+    return result;
   }
 
   private LocalDateTime parseLocalDateTime(String str) {
@@ -521,13 +572,20 @@ class RecordConverter {
 
   private String ensureTimestampFormat(String str) {
     String result = str;
+    // Convert space separator to 'T' (e.g., "2023-05-18 11:22:33" -> "2023-05-18T11:22:33")
     if (result.charAt(10) == ' ') {
       result = result.substring(0, 10) + 'T' + result.substring(11);
     }
-    if (result.length() > 22
-        && (result.charAt(19) == '+' || result.charAt(19) == '-')
-        && result.charAt(22) == ':') {
-      result = result.substring(0, 19) + result.substring(19).replace(":", "");
+    // Convert timezone offset from +HH:mm to +HHmm format
+    // Find the last '+' or '-' that represents timezone offset (after index 10 to skip date
+    // separators)
+    int offsetIdx = Math.max(result.lastIndexOf('+'), result.lastIndexOf('-'));
+    if (offsetIdx > 10) {
+      String offset = result.substring(offsetIdx);
+      // Check if offset is in +HH:mm format (length 6 with colon at position 3)
+      if (offset.length() == 6 && offset.charAt(3) == ':') {
+        result = result.substring(0, offsetIdx) + offset.replace(":", "");
+      }
     }
     return result;
   }
