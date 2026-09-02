@@ -30,6 +30,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
@@ -54,6 +55,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.transforms.Transforms;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.junit.jupiter.api.AfterEach;
@@ -287,6 +289,50 @@ public class TestEqualityDeleteConverter {
     Set<String> rows = readRows(table);
     assertThat(rows).hasSize(350);
     assertThat(rows).contains("0|b|v1", "250|a|v1").doesNotContain("0|a|v1", "249|a|v1");
+  }
+
+  @Test
+  public void testTransformPartitionIsPinnedInRangeMode() throws IOException {
+    Table table = createTable(PartitionSpec.builderFor(SCHEMA).bucket("id", 4).build());
+
+    // three batches, each writes one file per bucket
+    List<DataFile> dataFiles = Lists.newArrayList();
+    for (int batch = 0; batch < 3; batch++) {
+      List<Object[]> inserts = Lists.newArrayList();
+      for (long id = batch * 1000L; id < (batch + 1) * 1000L; id++) {
+        inserts.add(insert(id, "a", "v1"));
+      }
+      WriteResult result = write(table, inserts.toArray(new Object[0][]));
+      assertThat(result.dataFiles()).hasSize(4);
+      dataFiles.addAll(Arrays.asList(result.dataFiles()));
+    }
+    commit(table, dataFiles.toArray(new DataFile[0]), new DeleteFile[0], ImmutableList.of());
+
+    // more keys than the IN limit, all of them in bucket 0 and spread over all three batches
+    Function<Object, Integer> bucket = Transforms.bucket(4).bind(Types.LongType.get());
+    List<Long> bucketZeroIds = Lists.newArrayList();
+    for (long id = 0; id < 3000; id++) {
+      if (bucket.apply(id) == 0) {
+        bucketZeroIds.add(id);
+      }
+    }
+    List<Object[]> deletes = Lists.newArrayList();
+    for (int i = 0; i < 250; i++) {
+      deletes.add(delete(bucketZeroIds.get(i * bucketZeroIds.size() / 250), "a"));
+    }
+    WriteResult second = write(table, deletes.toArray(new Object[0][]));
+    assertThat(second.deleteFiles()).hasSize(1);
+
+    EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
+    EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
+
+    // the id range covers every file, the pinned bucket keeps only the three files of bucket 0
+    assertThat(converter.scannedDataFiles()).isEqualTo(3);
+    assertThat(result.dvFiles()).hasSize(3);
+    assertThat(result.dvFiles().stream().mapToLong(DeleteFile::recordCount).sum()).isEqualTo(250L);
+
+    commit(table, second.dataFiles(), result.dvFiles(), result.rewrittenDvFiles());
+    assertThat(readRows(table)).hasSize(3000 - 250);
   }
 
   @Test

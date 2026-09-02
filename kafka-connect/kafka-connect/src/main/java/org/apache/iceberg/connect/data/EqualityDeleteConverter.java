@@ -52,6 +52,7 @@ import org.apache.iceberg.deletes.BaseDVFileWriter;
 import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.expressions.UnboundTerm;
 import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.formats.ReadBuilder;
 import org.apache.iceberg.io.CloseableIterable;
@@ -65,6 +66,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.transforms.Transform;
+import org.apache.iceberg.transforms.UnknownTransform;
 import org.apache.iceberg.types.Comparators;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
@@ -90,12 +93,14 @@ import org.slf4j.LoggerFactory;
  * replaced vector is reported in {@link Result#rewrittenDvFiles()} and must be removed by the
  * commit.
  *
- * <p>The filter is built per partition of the equality delete files. Up to {@link
- * #IN_PREDICATE_LIMIT} keys are matched with an {@code IN} list per key column, which the metrics
- * evaluators still use for pruning. A larger key set is sorted on the leading key column and split
- * at the largest gaps into at most {@link #MAX_KEY_RANGES} value ranges, so a hot cluster of keys
- * and a few scattered keys prune to the files that hold them. Keys that are spread evenly over the
- * whole table still match most data files; without an index that scan cannot be avoided.
+ * <p>The filter is built per partition of the equality delete files, with the partition pinned
+ * through its transform so that the planner prunes to it even when the key filter cannot be
+ * projected onto the partition. Up to {@link #IN_PREDICATE_LIMIT} keys are matched with an {@code
+ * IN} list per key column, which the metrics evaluators still use for pruning. A larger key set is
+ * sorted on the leading key column and split at the largest gaps into at most {@link
+ * #MAX_KEY_RANGES} value ranges, so a hot cluster of keys and a few scattered keys prune to the
+ * files that hold them. Keys that are spread evenly over the whole table still match most data
+ * files; without an index that scan cannot be avoided.
  *
  * <p>The positions are only valid for the snapshot they were resolved against, see {@link
  * Result#baseSnapshotId()}. The commit that adds the deletion vectors has to validate that no
@@ -173,11 +178,12 @@ public class EqualityDeleteConverter {
         }
 
         deletedKeys += keys.size();
-        Expression filter =
-            Expressions.and(
-                partitionFilter(group.spec(), group.partition()), keyFilter(keySchema, keys));
-        conflictFilter = Expressions.or(conflictFilter, filter);
-        matchedRows += resolve(base, keySchema, keys, filter, previousDeletes, dvWriter);
+        Expression keyFilter = keyFilter(keySchema, keys);
+        Expression planFilter =
+            Expressions.and(partitionFilter(group.spec(), group.partition()), keyFilter);
+        conflictFilter = Expressions.or(conflictFilter, planFilter);
+        matchedRows +=
+            resolve(base, keySchema, keys, planFilter, keyFilter, previousDeletes, dvWriter);
       }
 
       dvWriter.close();
@@ -250,12 +256,17 @@ public class EqualityDeleteConverter {
    * Plans the data files of the base snapshot that may hold a deleted key, reads them in parallel
    * and adds the matching positions to the deletion vector writer. Returns the number of matched
    * rows.
+   *
+   * <p>The plan filter carries the partition pin and the key filter. Only the key filter is passed
+   * to the file readers: a data file belongs to exactly one partition, and the file-level filters
+   * evaluate column references, not partition transforms.
    */
   private long resolve(
       Snapshot base,
       Schema keySchema,
       StructLikeSet keys,
-      Expression filter,
+      Expression planFilter,
+      Expression keyFilter,
       Map<String, PositionDeleteIndex> previousDeletes,
       BaseDVFileWriter dvWriter)
       throws IOException {
@@ -264,7 +275,7 @@ public class EqualityDeleteConverter {
         table
             .newScan()
             .useSnapshot(base.snapshotId())
-            .filter(filter)
+            .filter(planFilter)
             .ignoreResiduals()
             .planFiles()) {
       tasks = Lists.newArrayList(planned);
@@ -278,7 +289,7 @@ public class EqualityDeleteConverter {
         .stopOnFailure()
         .throwFailureWhenFinished()
         .run(
-            task -> match(task, keySchema, keys, filter, previousDeletes, matches),
+            task -> match(task, keySchema, keys, keyFilter, previousDeletes, matches),
             IOException.class);
 
     AtomicLong matchedRows = new AtomicLong();
@@ -363,25 +374,32 @@ public class EqualityDeleteConverter {
   }
 
   /**
-   * Row filter for the partition of an equality delete file. Identity partition columns are pinned
-   * to the partition value; for other transforms the key filter on the source column is projected
-   * onto the partition by the scan planner.
+   * Row filter that pins the partition of an equality delete file. Every partition field is
+   * expressed through its transform, e.g. {@code bucket(16, id) = 3}, so the scan planner prunes to
+   * the partition even when the key filter is a range that a transform like bucket cannot project.
+   * Identity fields reference the column directly. Void fields carry no information and unknown
+   * transforms cannot be evaluated, so both are skipped.
    */
+  @SuppressWarnings("unchecked")
   private Expression partitionFilter(PartitionSpec spec, StructLike partition) {
     Expression filter = Expressions.alwaysTrue();
     List<PartitionField> fields = spec.fields();
     for (int pos = 0; pos < fields.size(); pos++) {
       PartitionField field = fields.get(pos);
-      if (!field.transform().isIdentity()) {
+      Transform<?, ?> transform = field.transform();
+      if (transform.isVoid() || transform instanceof UnknownTransform) {
         continue;
       }
 
       String column = table.schema().findColumnName(field.sourceId());
+      UnboundTerm<Object> term =
+          transform.isIdentity()
+              ? Expressions.ref(column)
+              : Expressions.transform(column, (Transform<?, Object>) transform);
       Object value = partition.get(pos, Object.class);
       filter =
           Expressions.and(
-              filter,
-              value == null ? Expressions.isNull(column) : Expressions.equal(column, value));
+              filter, value == null ? Expressions.isNull(term) : Expressions.equal(term, value));
     }
 
     return filter;
