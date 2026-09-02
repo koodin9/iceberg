@@ -27,10 +27,12 @@ import static org.mockito.Mockito.when;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.LongConsumer;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
@@ -38,6 +40,7 @@ import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -47,6 +50,7 @@ import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.WriteResult;
@@ -242,7 +246,7 @@ public class TestEqualityDeleteConverter {
 
     // more keys than the IN limit, so the keys are split into ranges at the largest gaps: the hot
     // range covers six files and every scattered key stays in its own file
-    assertThat(deletes).hasSizeGreaterThan(EqualityDeleteConverter.IN_PREDICATE_LIMIT);
+    assertThat(deletes).hasSizeGreaterThan(KeyFilters.IN_PREDICATE_LIMIT);
     assertThat(converter.scannedDataFiles()).isEqualTo(11);
     assertThat(result.dvFiles()).hasSize(11);
     assertThat(result.dvFiles().stream().mapToLong(DeleteFile::recordCount).sum()).isEqualTo(300L);
@@ -336,6 +340,71 @@ public class TestEqualityDeleteConverter {
   }
 
   @Test
+  public void testCustomResolver() throws IOException {
+    Table table = createTable(PartitionSpec.unpartitioned());
+    WriteResult first = write(table, insert(1L, "a", "v1"), insert(2L, "a", "v1"));
+    commit(table, first.dataFiles(), first.deleteFiles(), ImmutableList.of());
+    DataFile dataFile = first.dataFiles()[0];
+
+    WriteResult second = write(table, delete(2L, "a"));
+
+    // a resolver that knows the position of the row without reading the data file
+    KeyPositionResolver resolver =
+        (base, keySchema, keys, deleteSpec, deletePartition) -> {
+          assertThat(keys).hasSize(1);
+          KeyPositionResolver.FileMatches matches =
+              new KeyPositionResolver.FileMatches() {
+                @Override
+                public String path() {
+                  return dataFile.location();
+                }
+
+                @Override
+                public PartitionSpec spec() {
+                  return table.spec();
+                }
+
+                @Override
+                public StructLike partition() {
+                  return dataFile.partition();
+                }
+
+                @Override
+                public PositionDeleteIndex existingDeletes() {
+                  return null;
+                }
+
+                @Override
+                public void forEachPosition(LongConsumer consumer) {
+                  consumer.accept(1L);
+                }
+              };
+          return new KeyPositionResolver.Resolution() {
+            @Override
+            public Collection<KeyPositionResolver.FileMatches> matches() {
+              return ImmutableList.of(matches);
+            }
+
+            @Override
+            public int scannedDataFiles() {
+              return 0;
+            }
+          };
+        };
+
+    EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null, resolver);
+    EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
+
+    assertThat(converter.scannedDataFiles()).isEqualTo(0);
+    assertThat(result.dvFiles()).hasSize(1);
+    assertThat(result.dvFiles().get(0).referencedDataFile()).isEqualTo(dataFile.location());
+    assertThat(result.dvFiles().get(0).recordCount()).isEqualTo(1L);
+
+    commit(table, second.dataFiles(), result.dvFiles(), result.rewrittenDvFiles());
+    assertThat(readRows(table)).containsExactly("1|a|v1");
+  }
+
+  @Test
   public void testSplitIntoRanges() {
     // 200 consecutive values and a cluster of 100 far away
     List<Object> values = Lists.newArrayList();
@@ -347,8 +416,8 @@ public class TestEqualityDeleteConverter {
     }
 
     List<int[]> ranges =
-        EqualityDeleteConverter.splitIntoRanges(values, value -> ((Number) value).doubleValue());
-    assertThat(ranges).hasSize(EqualityDeleteConverter.MAX_KEY_RANGES);
+        KeyFilters.splitIntoRanges(values, value -> ((Number) value).doubleValue());
+    assertThat(ranges).hasSize(KeyFilters.MAX_KEY_RANGES);
     assertThat(ranges.get(0)[0]).isEqualTo(0);
     assertThat(ranges.get(ranges.size() - 1)[1]).isEqualTo(values.size() - 1);
     for (int i = 1; i < ranges.size(); i++) {
@@ -360,12 +429,12 @@ public class TestEqualityDeleteConverter {
             range -> (long) values.get(range[0]) <= 199L && (long) values.get(range[1]) >= 1000L);
 
     // without a numeric converter the values are split into ranges of equal size
-    List<int[]> equalRanges = EqualityDeleteConverter.splitIntoRanges(values, null);
-    assertThat(equalRanges).hasSize(EqualityDeleteConverter.MAX_KEY_RANGES);
+    List<int[]> equalRanges = KeyFilters.splitIntoRanges(values, null);
+    assertThat(equalRanges).hasSize(KeyFilters.MAX_KEY_RANGES);
     assertThat(equalRanges).allMatch(range -> range[1] - range[0] + 1 == 3);
 
     // fewer values than ranges: one range per value
-    List<int[]> single = EqualityDeleteConverter.splitIntoRanges(values.subList(0, 5), null);
+    List<int[]> single = KeyFilters.splitIntoRanges(values.subList(0, 5), null);
     assertThat(single).hasSize(5);
     assertThat(single).allMatch(range -> range[0] == range[1]);
   }
