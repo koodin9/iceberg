@@ -69,6 +69,7 @@ public class TestIcebergSinkConfig {
     IcebergSinkConfig config = new IcebergSinkConfig(props);
     assertThat(config.tablesCdcField()).isNull();
     assertThat(config.upsertModeEnabled()).isFalse();
+    assertThat(config.convertEqualityDeletesEnabled()).isFalse();
 
     props =
         ImmutableMap.of(
@@ -76,10 +77,12 @@ public class TestIcebergSinkConfig {
             "topics", "source-topic",
             "iceberg.tables", "db.landing",
             "iceberg.tables.cdc-field", "_cdc.op",
-            "iceberg.tables.upsert-mode-enabled", "true");
+            "iceberg.tables.upsert-mode-enabled", "true",
+            "iceberg.tables.convert-equality-deletes-enabled", "true");
     config = new IcebergSinkConfig(props);
     assertThat(config.tablesCdcField()).isEqualTo("_cdc.op");
     assertThat(config.upsertModeEnabled()).isTrue();
+    assertThat(config.convertEqualityDeletesEnabled()).isTrue();
   }
 
   @Test

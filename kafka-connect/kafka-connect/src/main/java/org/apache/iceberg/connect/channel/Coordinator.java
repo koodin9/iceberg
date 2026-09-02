@@ -28,6 +28,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -41,13 +42,17 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotAncestryValidator;
+import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.IcebergSinkConfig;
+import org.apache.iceberg.connect.data.EqualityDeleteConverter;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataWritten;
@@ -55,8 +60,12 @@ import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.relocated.com.google.common.collect.Streams;
 import org.apache.iceberg.relocated.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.iceberg.util.SnapshotUtil;
@@ -74,7 +83,11 @@ class Coordinator extends Channel {
   private static final String COMMIT_ID_SNAPSHOT_PROP = "kafka.connect.commit-id";
   private static final String TASK_ID_SNAPSHOT_PROP = "kafka.connect.task-id";
   private static final String VALID_THROUGH_TS_SNAPSHOT_PROP = "kafka.connect.valid-through-ts";
+  private static final String CONVERTED_EQ_DELETE_FILES_SNAPSHOT_PROP =
+      "kafka.connect.converted-equality-delete-files";
   private static final Duration POLL_DURATION = Duration.ofSeconds(1);
+  // attempts to commit converted deletion vectors before the equality deletes are committed as is
+  private static final int EQ_DELETE_CONVERSION_ATTEMPTS = 3;
 
   private final Catalog catalog;
   private final IcebergSinkConfig config;
@@ -83,6 +96,7 @@ class Coordinator extends Channel {
   private final ExecutorService exec;
   private final CommitState commitState;
   private final AtomicLong partialCommitFailures = new AtomicLong();
+  private final AtomicLong eqDeleteConversionFallbacks = new AtomicLong();
   private volatile boolean terminated;
   private final String taskId;
   private int consecutiveCommitFailures;
@@ -304,32 +318,32 @@ class Coordinator extends Channel {
       LOG.info(
           "Coordinator {} found nothing to commit to table {}, skipping", taskId, tableIdentifier);
     } else {
-      if (deleteFiles.isEmpty()) {
+      List<DeleteFile> eqDeleteFiles =
+          deleteFiles.stream()
+              .filter(deleteFile -> deleteFile.content() == FileContent.EQUALITY_DELETES)
+              .collect(Collectors.toList());
+
+      if (!eqDeleteFiles.isEmpty() && convertEqualityDeletes(table, tableIdentifier)) {
+        commitConvertedEqualityDeletes(
+            table,
+            tableIdentifier,
+            branch,
+            committedOffsets,
+            offsetsJson,
+            validThroughTs,
+            dataFiles,
+            deleteFiles,
+            eqDeleteFiles);
+      } else if (deleteFiles.isEmpty()) {
         AppendFiles appendOp =
             table.newAppend().validateWith(offsetValidator(tableIdentifier, committedOffsets));
-        if (branch != null) {
-          appendOp.toBranch(branch);
-        }
-        appendOp.set(snapshotOffsetsProp, offsetsJson);
-        appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
-        appendOp.set(TASK_ID_SNAPSHOT_PROP, taskId);
-        if (validThroughTs != null) {
-          appendOp.set(VALID_THROUGH_TS_SNAPSHOT_PROP, validThroughTs.toString());
-        }
+        setCommitProperties(appendOp, branch, offsetsJson, validThroughTs);
         dataFiles.forEach(appendOp::appendFile);
         appendOp.commit();
       } else {
         RowDelta deltaOp =
-            table.newRowDelta().validateWith(offsetValidator(tableIdentifier, committedOffsets));
-        if (branch != null) {
-          deltaOp.toBranch(branch);
-        }
-        deltaOp.set(snapshotOffsetsProp, offsetsJson);
-        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
-        deltaOp.set(TASK_ID_SNAPSHOT_PROP, taskId);
-        if (validThroughTs != null) {
-          deltaOp.set(VALID_THROUGH_TS_SNAPSHOT_PROP, validThroughTs.toString());
-        }
+            newRowDelta(
+                table, tableIdentifier, branch, committedOffsets, offsetsJson, validThroughTs);
         dataFiles.forEach(deltaOp::addRows);
         deleteFiles.forEach(deltaOp::addDeletes);
         deltaOp.commit();
@@ -350,6 +364,157 @@ class Coordinator extends Channel {
           snapshotId,
           commitState.currentCommitId(),
           validThroughTs);
+    }
+  }
+
+  private void setCommitProperties(
+      SnapshotUpdate<?> op, String branch, String offsetsJson, OffsetDateTime validThroughTs) {
+    if (branch != null) {
+      op.toBranch(branch);
+    }
+    op.set(snapshotOffsetsProp, offsetsJson);
+    op.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+    op.set(TASK_ID_SNAPSHOT_PROP, taskId);
+    if (validThroughTs != null) {
+      op.set(VALID_THROUGH_TS_SNAPSHOT_PROP, validThroughTs.toString());
+    }
+  }
+
+  private RowDelta newRowDelta(
+      Table table,
+      TableIdentifier tableIdentifier,
+      String branch,
+      Map<Integer, Long> committedOffsets,
+      String offsetsJson,
+      OffsetDateTime validThroughTs) {
+    RowDelta deltaOp =
+        table.newRowDelta().validateWith(offsetValidator(tableIdentifier, committedOffsets));
+    setCommitProperties(deltaOp, branch, offsetsJson, validThroughTs);
+    return deltaOp;
+  }
+
+  private boolean convertEqualityDeletes(Table table, TableIdentifier tableIdentifier) {
+    if (!config.convertEqualityDeletesEnabled()) {
+      return false;
+    }
+
+    if (TableUtil.formatVersion(table) < 3) {
+      LOG.warn(
+          "Coordinator {} cannot convert equality deletes for table {}, deletion vectors require "
+              + "format version 3",
+          taskId,
+          tableIdentifier);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Commits the batch with its equality deletes resolved into deletion vectors, so that readers of
+   * the table never see an equality delete file. The positions are resolved against the current
+   * snapshot; if another commit changes the matched rows in the meantime the commit fails
+   * validation and the conversion is repeated. After {@link #EQ_DELETE_CONVERSION_ATTEMPTS} such
+   * failures the equality delete files are committed as they are, which keeps the data correct at
+   * the cost of read performance.
+   */
+  private void commitConvertedEqualityDeletes(
+      Table table,
+      TableIdentifier tableIdentifier,
+      String branch,
+      Map<Integer, Long> committedOffsets,
+      String offsetsJson,
+      OffsetDateTime validThroughTs,
+      List<DataFile> dataFiles,
+      List<DeleteFile> deleteFiles,
+      List<DeleteFile> eqDeleteFiles) {
+    List<DeleteFile> otherDeleteFiles =
+        deleteFiles.stream()
+            .filter(deleteFile -> deleteFile.content() != FileContent.EQUALITY_DELETES)
+            .collect(Collectors.toList());
+    EqualityDeleteConverter converter = new EqualityDeleteConverter(table, branch);
+
+    for (int attempt = 1; attempt <= EQ_DELETE_CONVERSION_ATTEMPTS; attempt++) {
+      table.refresh();
+      EqualityDeleteConverter.Result result = converter.convert(eqDeleteFiles);
+
+      RowDelta deltaOp =
+          newRowDelta(
+              table, tableIdentifier, branch, committedOffsets, offsetsJson, validThroughTs);
+      deltaOp.set(CONVERTED_EQ_DELETE_FILES_SNAPSHOT_PROP, String.valueOf(eqDeleteFiles.size()));
+      dataFiles.forEach(deltaOp::addRows);
+      otherDeleteFiles.forEach(deltaOp::addDeletes);
+      result.dvFiles().forEach(deltaOp::addDeletes);
+      result.rewrittenDvFiles().forEach(deltaOp::removeDeletes);
+
+      if (result.baseSnapshotId() != null) {
+        // rows for the deleted keys added after the base snapshot would be missed by the vectors
+        deltaOp
+            .validateFromSnapshot(result.baseSnapshotId())
+            .conflictDetectionFilter(result.conflictFilter())
+            .validateNoConflictingDataFiles()
+            .validateNoConflictingDeleteFiles();
+        Set<CharSequence> referencedDataFiles = result.referencedDataFiles();
+        if (!referencedDataFiles.isEmpty()) {
+          deltaOp.validateDataFilesExist(referencedDataFiles).validateDeletedFiles();
+        }
+      }
+
+      try {
+        deltaOp.commit();
+      } catch (ValidationException e) {
+        deleteFiles(table, result.dvFiles());
+        if (attempt < EQ_DELETE_CONVERSION_ATTEMPTS) {
+          LOG.warn(
+              "Coordinator {} detected a concurrent change to table {} while converting equality "
+                  + "deletes (attempt {} of {}), converting again",
+              taskId,
+              tableIdentifier,
+              attempt,
+              EQ_DELETE_CONVERSION_ATTEMPTS,
+              e);
+          continue;
+        }
+
+        LOG.warn(
+            "Coordinator {} gave up converting equality deletes for table {} after {} attempts, "
+                + "committing the equality delete files as they are",
+            taskId,
+            tableIdentifier,
+            EQ_DELETE_CONVERSION_ATTEMPTS,
+            e);
+        eqDeleteConversionFallbacks.incrementAndGet();
+        RowDelta fallbackOp =
+            newRowDelta(
+                table, tableIdentifier, branch, committedOffsets, offsetsJson, validThroughTs);
+        dataFiles.forEach(fallbackOp::addRows);
+        deleteFiles.forEach(fallbackOp::addDeletes);
+        fallbackOp.commit();
+        return;
+      } catch (RuntimeException e) {
+        if (!(e instanceof CommitStateUnknownException)) {
+          // the outcome is known to be a failure, so the vectors are not referenced by any snapshot
+          deleteFiles(table, result.dvFiles());
+        }
+        throw e;
+      }
+
+      // the equality deletes are covered by the committed vectors and are not referenced anywhere
+      deleteFiles(table, eqDeleteFiles);
+      return;
+    }
+  }
+
+  /** Best-effort removal of files no snapshot references; a failure only leaves orphan files. */
+  private void deleteFiles(Table table, List<DeleteFile> files) {
+    Set<String> locations = Sets.newHashSet();
+    files.forEach(file -> locations.add(file.location()));
+    for (String location : locations) {
+      try {
+        table.io().deleteFile(location);
+      } catch (RuntimeException e) {
+        LOG.warn("Coordinator {} failed to delete unreferenced file {}", taskId, location, e);
+      }
     }
   }
 
@@ -424,6 +589,11 @@ class Coordinator extends Channel {
 
   long partialCommitFailureCount() {
     return partialCommitFailures.get();
+  }
+
+  @VisibleForTesting
+  long eqDeleteConversionFallbackCount() {
+    return eqDeleteConversionFallbacks.get();
   }
 
   void terminate() {

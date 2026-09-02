@@ -73,6 +73,7 @@ for exactly-once semantics. This requires Kafka 2.5 or later.
 | iceberg.tables.schema-case-insensitive     | Set to `true` to look up table columns by case-insensitive name, default is `false` for case-sensitive           |
 | iceberg.tables.cdc-field                   | Source record field that holds the CDC operation (`I`, `U` or `D`), see [CDC and upsert writes](#cdc-and-upsert-writes) |
 | iceberg.tables.upsert-mode-enabled         | Set to `true` to treat every record as an upsert on the identifier fields, default is `false`                     |
+| iceberg.tables.convert-equality-deletes-enabled | Set to `true` to resolve equality deletes into deletion vectors at commit time, default is `false`, see [Equality delete conversion](#equality-delete-conversion) |
 | iceberg.tables.auto-create-props.*         | Properties set on new tables during auto-create                                                                  |
 | iceberg.tables.write-props.*               | Properties passed through to Iceberg writer initialization, these take precedence                                |
 | iceberg.table.<_table-name_\>.commit-branch | Table-specific branch for commits, use `iceberg.tables.default-commit-branch` if not specified                   |
@@ -121,6 +122,31 @@ instead; on format version 3 tables this is a deletion vector. Requirements:
 
 A schema change in the middle of a commit replaces the writer, so a duplicate key that straddles the
 change is not deduplicated within that commit.
+
+#### Equality delete conversion
+
+Equality delete files are cheap to write but expensive to read: every reader has to load them and
+compare every row of the older data files against them. With `iceberg.tables.convert-equality-deletes-enabled`
+set to `true` the coordinator resolves the equality deletes of a commit before the commit is made.
+It plans the data files of the current snapshot that may hold a deleted key, reads the identifier
+columns of those files, and writes the positions of the matching rows as deletion vectors. The
+commit then contains the new data files and the deletion vectors, and the equality delete files are
+discarded, so readers of the table never see an equality delete.
+
+Requirements and behavior:
+
+* The table must use format version 3, which introduces deletion vectors. On version 2 tables the
+  equality delete files are committed unchanged and a warning is logged.
+* Data files that still carry position delete files from before the version 3 upgrade must be
+  rewritten first, because a deletion vector replaces all position deletes of its data file.
+* Candidate files are pruned with the partition and column statistics of the identifier columns, so
+  the cost of a commit grows with the number of data files whose identifier value range overlaps the
+  deleted keys. Monotonically increasing keys prune well; random keys such as UUIDs may require a
+  scan of the whole partition on every commit. Choose the commit interval accordingly.
+* The commit validates that no other writer added data or delete files for the deleted keys since
+  the positions were resolved. On a conflict the conversion is repeated; after three failed attempts
+  the equality delete files are committed as they are, which keeps the data correct. Such a commit
+  lacks the `kafka.connect.converted-equality-delete-files` snapshot property.
 
 ### Kafka configuration
 

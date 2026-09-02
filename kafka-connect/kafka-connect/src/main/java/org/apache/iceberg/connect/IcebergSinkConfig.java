@@ -82,6 +82,8 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_CDC_FIELD_PROP = "iceberg.tables.cdc-field";
   private static final String TABLES_UPSERT_MODE_ENABLED_PROP =
       "iceberg.tables.upsert-mode-enabled";
+  private static final String TABLES_CONVERT_EQUALITY_DELETES_ENABLED_PROP =
+      "iceberg.tables.convert-equality-deletes-enabled";
   private static final String CONTROL_TOPIC_PROP = "iceberg.control.topic";
   private static final String CONTROL_GROUP_ID_PREFIX_PROP = "iceberg.control.group-id-prefix";
   private static final String COMMIT_INTERVAL_MS_PROP = "iceberg.control.commit.interval-ms";
@@ -194,6 +196,12 @@ public class IcebergSinkConfig extends AbstractConfig {
         false,
         Importance.MEDIUM,
         "Set to true to treat every record as an upsert on the identifier fields, false otherwise");
+    configDef.define(
+        TABLES_CONVERT_EQUALITY_DELETES_ENABLED_PROP,
+        ConfigDef.Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Set to true to resolve equality deletes into deletion vectors at commit time on format version 3 tables, false to commit equality delete files");
     configDef.define(
         CATALOG_NAME_PROP,
         ConfigDef.Type.STRING,
@@ -484,6 +492,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public boolean upsertModeEnabled() {
     return getBoolean(TABLES_UPSERT_MODE_ENABLED_PROP);
+  }
+
+  public boolean convertEqualityDeletesEnabled() {
+    return getBoolean(TABLES_CONVERT_EQUALITY_DELETES_ENABLED_PROP);
   }
 
   public JsonConverter jsonConverter() {
