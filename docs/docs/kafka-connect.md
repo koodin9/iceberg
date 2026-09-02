@@ -139,10 +139,14 @@ Requirements and behavior:
   equality delete files are committed unchanged and a warning is logged.
 * Data files that still carry position delete files from before the version 3 upgrade must be
   rewritten first, because a deletion vector replaces all position deletes of its data file.
-* Candidate files are pruned with the partition and column statistics of the identifier columns, so
-  the cost of a commit grows with the number of data files whose identifier value range overlaps the
-  deleted keys. Monotonically increasing keys prune well; random keys such as UUIDs may require a
-  scan of the whole partition on every commit. Choose the commit interval accordingly.
+* Candidate files are pruned per partition with the column statistics of the identifier columns:
+  up to 200 deleted keys are matched with an `IN` list, a larger key set is split at the largest
+  gaps of the leading identifier column into at most 100 value ranges. The cost of a commit therefore
+  grows with the number of data files that hold a deleted key, plus files whose statistics overlap
+  the ranges. This works well when the changed keys of a commit cluster in a few files, which is
+  typical for recently inserted rows. Keys that are spread evenly over a large table, such as random
+  UUIDs or uniform updates of old rows, match most data files of the partition and are read on every
+  commit; only an index would avoid that scan. Choose the commit interval accordingly.
 * The commit validates that no other writer added data or delete files for the deleted keys since
   the positions were resolved. On a conflict the conversion is repeated; after three failed attempts
   the equality delete files are committed as they are, which keeps the data correct. Such a commit

@@ -207,6 +207,124 @@ public class TestEqualityDeleteConverter {
   }
 
   @Test
+  public void testClusteredKeysPruneToTheirFiles() throws IOException {
+    Table table = createTable(PartitionSpec.unpartitioned());
+
+    // 200 data files with 50 consecutive ids each
+    int fileCount = 200;
+    int rowsPerFile = 50;
+    List<DataFile> dataFiles = Lists.newArrayList();
+    for (int file = 0; file < fileCount; file++) {
+      List<Object[]> inserts = Lists.newArrayList();
+      for (int row = 0; row < rowsPerFile; row++) {
+        inserts.add(insert((long) file * rowsPerFile + row, "a", "v1"));
+      }
+      WriteResult result = write(table, inserts.toArray(new Object[0][]));
+      assertThat(result.dataFiles()).hasSize(1);
+      dataFiles.add(result.dataFiles()[0]);
+    }
+    commit(table, dataFiles.toArray(new DataFile[0]), new DeleteFile[0], ImmutableList.of());
+
+    // 295 hot keys in the last six files and five keys scattered over the table
+    List<Object[]> deletes = Lists.newArrayList();
+    for (long id = 9700; id < 9995; id++) {
+      deletes.add(delete(id, "a"));
+    }
+    for (long id : new long[] {5, 1005, 3005, 6005, 8005}) {
+      deletes.add(delete(id, "a"));
+    }
+    WriteResult second = write(table, deletes.toArray(new Object[0][]));
+
+    EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
+    EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
+
+    // more keys than the IN limit, so the keys are split into ranges at the largest gaps: the hot
+    // range covers six files and every scattered key stays in its own file
+    assertThat(deletes).hasSizeGreaterThan(EqualityDeleteConverter.IN_PREDICATE_LIMIT);
+    assertThat(converter.scannedDataFiles()).isEqualTo(11);
+    assertThat(result.dvFiles()).hasSize(11);
+    assertThat(result.dvFiles().stream().mapToLong(DeleteFile::recordCount).sum()).isEqualTo(300L);
+
+    commit(table, second.dataFiles(), result.dvFiles(), result.rewrittenDvFiles());
+    assertThat(readRows(table)).hasSize(fileCount * rowsPerFile - 300);
+  }
+
+  @Test
+  public void testRangeFilterIsScopedToPartition() throws IOException {
+    Table table = createTable(PartitionSpec.builderFor(SCHEMA).identity("category").build());
+    TableSinkConfig tableConfig = mock(TableSinkConfig.class);
+    when(tableConfig.idColumns()).thenReturn(ImmutableList.of("id", "category"));
+    when(config.tableConfig(any())).thenReturn(tableConfig);
+
+    // three files of 100 ids in each of the partitions a and b, ids overlap across partitions
+    List<DataFile> dataFiles = Lists.newArrayList();
+    for (String category : new String[] {"a", "b"}) {
+      for (int file = 0; file < 3; file++) {
+        List<Object[]> inserts = Lists.newArrayList();
+        for (int row = 0; row < 100; row++) {
+          inserts.add(insert((long) file * 100 + row, category, "v1"));
+        }
+        WriteResult result = write(table, inserts.toArray(new Object[0][]));
+        dataFiles.add(result.dataFiles()[0]);
+      }
+    }
+    commit(table, dataFiles.toArray(new DataFile[0]), new DeleteFile[0], ImmutableList.of());
+
+    List<Object[]> deletes = Lists.newArrayList();
+    for (long id = 0; id < 250; id++) {
+      deletes.add(delete(id, "a"));
+    }
+    WriteResult second = write(table, deletes.toArray(new Object[0][]));
+
+    EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
+    EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
+
+    // the range on id covers every file of both partitions, the partition pins it to a
+    assertThat(converter.scannedDataFiles()).isEqualTo(3);
+    assertThat(result.dvFiles()).hasSize(3);
+
+    commit(table, second.dataFiles(), result.dvFiles(), result.rewrittenDvFiles());
+    Set<String> rows = readRows(table);
+    assertThat(rows).hasSize(350);
+    assertThat(rows).contains("0|b|v1", "250|a|v1").doesNotContain("0|a|v1", "249|a|v1");
+  }
+
+  @Test
+  public void testSplitIntoRanges() {
+    // 200 consecutive values and a cluster of 100 far away
+    List<Object> values = Lists.newArrayList();
+    for (long value = 0; value < 200; value++) {
+      values.add(value);
+    }
+    for (long value = 1000; value < 1100; value++) {
+      values.add(value);
+    }
+
+    List<int[]> ranges =
+        EqualityDeleteConverter.splitIntoRanges(values, value -> ((Number) value).doubleValue());
+    assertThat(ranges).hasSize(EqualityDeleteConverter.MAX_KEY_RANGES);
+    assertThat(ranges.get(0)[0]).isEqualTo(0);
+    assertThat(ranges.get(ranges.size() - 1)[1]).isEqualTo(values.size() - 1);
+    for (int i = 1; i < ranges.size(); i++) {
+      assertThat(ranges.get(i)[0]).isEqualTo(ranges.get(i - 1)[1] + 1);
+    }
+    // no range spans the gap between 199 and 1000
+    assertThat(ranges)
+        .noneMatch(
+            range -> (long) values.get(range[0]) <= 199L && (long) values.get(range[1]) >= 1000L);
+
+    // without a numeric converter the values are split into ranges of equal size
+    List<int[]> equalRanges = EqualityDeleteConverter.splitIntoRanges(values, null);
+    assertThat(equalRanges).hasSize(EqualityDeleteConverter.MAX_KEY_RANGES);
+    assertThat(equalRanges).allMatch(range -> range[1] - range[0] + 1 == 3);
+
+    // fewer values than ranges: one range per value
+    List<int[]> single = EqualityDeleteConverter.splitIntoRanges(values.subList(0, 5), null);
+    assertThat(single).hasSize(5);
+    assertThat(single).allMatch(range -> range[0] == range[1]);
+  }
+
+  @Test
   public void testConvertOnBranch() throws IOException {
     Table table = createTable(PartitionSpec.unpartitioned());
     WriteResult first = write(table, insert(1L, "a", "v1"), insert(2L, "a", "v1"));

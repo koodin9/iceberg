@@ -20,15 +20,17 @@ package org.apache.iceberg.connect.data;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.Collections;
+import java.math.BigDecimal;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongConsumer;
+import java.util.function.ToDoubleFunction;
 import org.apache.iceberg.Accessor;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -36,6 +38,7 @@ import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.MetadataColumns;
+import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
@@ -63,10 +66,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Comparators;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.StructLikeSet;
+import org.apache.iceberg.util.StructLikeWrapper;
 import org.apache.iceberg.util.StructProjection;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
@@ -79,12 +84,18 @@ import org.slf4j.LoggerFactory;
  *
  * <p>An equality delete written by the sink deletes every row of an earlier commit whose identifier
  * fields equal one of the deleted keys. To find those rows without an index, the converter plans
- * the data files of the current snapshot with a filter built from the deleted keys (an {@code IN}
- * list for a small key set, a value range per key column for a large one), reads only the key
- * columns and the row position of the remaining candidate files and keeps the positions whose key
- * is in the deleted set. A data file that already has a deletion vector gets a merged one; the
+ * the data files of the current snapshot with a filter built from the deleted keys, reads only the
+ * key columns and the row position of the remaining candidate files and keeps the positions whose
+ * key is in the deleted set. A data file that already has a deletion vector gets a merged one; the
  * replaced vector is reported in {@link Result#rewrittenDvFiles()} and must be removed by the
  * commit.
+ *
+ * <p>The filter is built per partition of the equality delete files. Up to {@link
+ * #IN_PREDICATE_LIMIT} keys are matched with an {@code IN} list per key column, which the metrics
+ * evaluators still use for pruning. A larger key set is sorted on the leading key column and split
+ * at the largest gaps into at most {@link #MAX_KEY_RANGES} value ranges, so a hot cluster of keys
+ * and a few scattered keys prune to the files that hold them. Keys that are spread evenly over the
+ * whole table still match most data files; without an index that scan cannot be avoided.
  *
  * <p>The positions are only valid for the snapshot they were resolved against, see {@link
  * Result#baseSnapshotId()}. The commit that adds the deletion vectors has to validate that no
@@ -98,8 +109,10 @@ public class EqualityDeleteConverter {
 
   private static final Logger LOG = LoggerFactory.getLogger(EqualityDeleteConverter.class);
 
-  // metrics evaluators stop pruning with IN predicates above this many values, a range is used then
-  private static final int IN_PREDICATE_LIMIT = 200;
+  // metrics evaluators stop pruning with IN predicates above this many values
+  @VisibleForTesting static final int IN_PREDICATE_LIMIT = 200;
+  // bounds the filter size per partition, and with it the evaluation cost per data file
+  @VisibleForTesting static final int MAX_KEY_RANGES = 100;
 
   private final Table table;
   private final String branch;
@@ -132,17 +145,7 @@ public class EqualityDeleteConverter {
       return Result.empty();
     }
 
-    Map<Set<Integer>, List<DeleteFile>> filesByEqualityFields = Maps.newLinkedHashMap();
-    for (DeleteFile deleteFile : eqDeleteFiles) {
-      Preconditions.checkArgument(
-          deleteFile.content() == FileContent.EQUALITY_DELETES,
-          "Not an equality delete file: %s",
-          deleteFile.location());
-      filesByEqualityFields
-          .computeIfAbsent(
-              ImmutableSet.copyOf(deleteFile.equalityFieldIds()), ids -> Lists.newArrayList())
-          .add(deleteFile);
-    }
+    Map<DeleteGroup, List<DeleteFile>> groups = groupDeleteFiles(eqDeleteFiles);
 
     OutputFileFactory fileFactory =
         OutputFileFactory.builderFor(table, 1, System.currentTimeMillis())
@@ -161,15 +164,18 @@ public class EqualityDeleteConverter {
 
     long start = System.currentTimeMillis();
     try {
-      for (Map.Entry<Set<Integer>, List<DeleteFile>> entry : filesByEqualityFields.entrySet()) {
-        Schema keySchema = keySchema(entry.getKey());
+      for (Map.Entry<DeleteGroup, List<DeleteFile>> entry : groups.entrySet()) {
+        DeleteGroup group = entry.getKey();
+        Schema keySchema = keySchema(group.equalityFieldIds());
         StructLikeSet keys = deleteLoader.loadEqualityDeletes(entry.getValue(), keySchema);
         if (keys.isEmpty()) {
           continue;
         }
 
         deletedKeys += keys.size();
-        Expression filter = keyFilter(keySchema, keys);
+        Expression filter =
+            Expressions.and(
+                partitionFilter(group.spec(), group.partition()), keyFilter(keySchema, keys));
         conflictFilter = Expressions.or(conflictFilter, filter);
         matchedRows += resolve(base, keySchema, keys, filter, previousDeletes, dvWriter);
       }
@@ -202,6 +208,32 @@ public class EqualityDeleteConverter {
   @VisibleForTesting
   int scannedDataFiles() {
     return scannedDataFiles.get();
+  }
+
+  /**
+   * Groups the delete files by equality field set and partition. A partitioned equality delete only
+   * applies to its own partition, and a smaller key set per group prunes better.
+   */
+  private Map<DeleteGroup, List<DeleteFile>> groupDeleteFiles(List<DeleteFile> eqDeleteFiles) {
+    Map<DeleteGroup, List<DeleteFile>> groups = Maps.newLinkedHashMap();
+    for (DeleteFile deleteFile : eqDeleteFiles) {
+      Preconditions.checkArgument(
+          deleteFile.content() == FileContent.EQUALITY_DELETES,
+          "Not an equality delete file: %s",
+          deleteFile.location());
+      PartitionSpec spec = table.specs().get(deleteFile.specId());
+      Preconditions.checkArgument(
+          spec != null,
+          "Unknown partition spec %s for %s",
+          deleteFile.specId(),
+          deleteFile.location());
+      DeleteGroup group =
+          new DeleteGroup(
+              ImmutableSet.copyOf(deleteFile.equalityFieldIds()), spec, deleteFile.partition());
+      groups.computeIfAbsent(group, key -> Lists.newArrayList()).add(deleteFile);
+    }
+
+    return groups;
   }
 
   private Schema keySchema(Set<Integer> equalityFieldIds) {
@@ -331,12 +363,45 @@ public class EqualityDeleteConverter {
   }
 
   /**
-   * Builds a file pruning filter from the deleted keys. Rows are still matched exactly, so the
-   * filter only has to be inclusive: an {@code IN} list per key column while the metrics evaluators
-   * still use it for pruning, a value range per key column above that.
+   * Row filter for the partition of an equality delete file. Identity partition columns are pinned
+   * to the partition value; for other transforms the key filter on the source column is projected
+   * onto the partition by the scan planner.
    */
-  @SuppressWarnings("unchecked")
-  private static Expression keyFilter(Schema keySchema, StructLikeSet keys) {
+  private Expression partitionFilter(PartitionSpec spec, StructLike partition) {
+    Expression filter = Expressions.alwaysTrue();
+    List<PartitionField> fields = spec.fields();
+    for (int pos = 0; pos < fields.size(); pos++) {
+      PartitionField field = fields.get(pos);
+      if (!field.transform().isIdentity()) {
+        continue;
+      }
+
+      String column = table.schema().findColumnName(field.sourceId());
+      Object value = partition.get(pos, Object.class);
+      filter =
+          Expressions.and(
+              filter,
+              value == null ? Expressions.isNull(column) : Expressions.equal(column, value));
+    }
+
+    return filter;
+  }
+
+  /**
+   * Builds a file pruning filter from the deleted keys. Rows are still matched exactly, so the
+   * filter only has to be inclusive.
+   */
+  @VisibleForTesting
+  static Expression keyFilter(Schema keySchema, StructLikeSet keys) {
+    if (keys.size() <= IN_PREDICATE_LIMIT) {
+      return inFilter(keySchema, keys);
+    }
+
+    return rangeFilter(keySchema, keys);
+  }
+
+  /** One {@code IN} list per key column; the metrics evaluators prune with lists of this size. */
+  private static Expression inFilter(Schema keySchema, StructLikeSet keys) {
     Expression filter = Expressions.alwaysTrue();
     List<Types.NestedField> columns = keySchema.columns();
     for (int pos = 0; pos < columns.size(); pos++) {
@@ -357,22 +422,8 @@ public class EqualityDeleteConverter {
         }
       }
 
-      Expression columnFilter;
-      if (values.isEmpty()) {
-        columnFilter = Expressions.alwaysFalse();
-      } else if (values.size() <= IN_PREDICATE_LIMIT) {
-        columnFilter = Expressions.in(column.name(), values);
-      } else {
-        Comparator<Object> comparator =
-            (Comparator<Object>) Comparators.forType(column.type().asPrimitiveType());
-        Object min = Collections.min(values, comparator);
-        Object max = Collections.max(values, comparator);
-        columnFilter =
-            Expressions.and(
-                Expressions.greaterThanOrEqual(column.name(), min),
-                Expressions.lessThanOrEqual(column.name(), max));
-      }
-
+      Expression columnFilter =
+          values.isEmpty() ? Expressions.alwaysFalse() : Expressions.in(column.name(), values);
       if (hasNull) {
         columnFilter = Expressions.or(columnFilter, Expressions.isNull(column.name()));
       }
@@ -381,6 +432,127 @@ public class EqualityDeleteConverter {
     }
 
     return filter;
+  }
+
+  /**
+   * Sorts the values of the leading key column and splits them into at most {@link #MAX_KEY_RANGES}
+   * ranges. Numeric and temporal keys are split at the largest gaps, so a cluster of hot keys and a
+   * few scattered keys each get a tight range; other types are split into ranges with an equal
+   * number of keys.
+   */
+  @SuppressWarnings("unchecked")
+  private static Expression rangeFilter(Schema keySchema, StructLikeSet keys) {
+    Types.NestedField lead = null;
+    int leadPos = -1;
+    List<Types.NestedField> columns = keySchema.columns();
+    for (int pos = 0; pos < columns.size(); pos++) {
+      if (columns.get(pos).type().isPrimitiveType()) {
+        lead = columns.get(pos);
+        leadPos = pos;
+        break;
+      }
+    }
+
+    if (lead == null) {
+      return Expressions.alwaysTrue();
+    }
+
+    List<Object> values = Lists.newArrayListWithCapacity(keys.size());
+    boolean hasNull = false;
+    for (StructLike key : keys) {
+      Object value = key.get(leadPos, Object.class);
+      if (value == null) {
+        hasNull = true;
+      } else {
+        values.add(value);
+      }
+    }
+
+    Expression filter = Expressions.alwaysFalse();
+    if (!values.isEmpty()) {
+      Comparator<Object> comparator =
+          (Comparator<Object>) Comparators.forType(lead.type().asPrimitiveType());
+      values.sort(comparator);
+      for (int[] range : splitIntoRanges(values, numericConverter(lead.type()))) {
+        Object min = values.get(range[0]);
+        Object max = values.get(range[1]);
+        filter =
+            Expressions.or(
+                filter,
+                Expressions.and(
+                    Expressions.greaterThanOrEqual(lead.name(), min),
+                    Expressions.lessThanOrEqual(lead.name(), max)));
+      }
+    }
+
+    if (hasNull) {
+      filter = Expressions.or(filter, Expressions.isNull(lead.name()));
+    }
+
+    return filter;
+  }
+
+  /**
+   * Returns index ranges [first, last] over the sorted values. With a numeric converter the ranges
+   * are separated at the largest gaps between neighboring values; otherwise the values are split
+   * into ranges of equal size.
+   */
+  @VisibleForTesting
+  static List<int[]> splitIntoRanges(List<Object> sortedValues, ToDoubleFunction<Object> numeric) {
+    int size = sortedValues.size();
+    int rangeCount = Math.min(MAX_KEY_RANGES, size);
+    List<Integer> splits = Lists.newArrayListWithCapacity(rangeCount);
+
+    if (numeric != null) {
+      // a split after index i separates values i and i + 1; keep the largest gaps
+      List<Integer> byGap = Lists.newArrayListWithCapacity(size - 1);
+      for (int i = 0; i < size - 1; i++) {
+        byGap.add(i);
+      }
+
+      byGap.sort(
+          Comparator.comparingDouble(
+                  (Integer i) ->
+                      numeric.applyAsDouble(sortedValues.get(i + 1))
+                          - numeric.applyAsDouble(sortedValues.get(i)))
+              .reversed());
+      splits.addAll(byGap.subList(0, rangeCount - 1));
+    } else {
+      for (int i = 1; i < rangeCount; i++) {
+        splits.add((int) ((long) i * size / rangeCount) - 1);
+      }
+    }
+
+    splits.sort(Comparator.naturalOrder());
+
+    List<int[]> ranges = Lists.newArrayListWithCapacity(rangeCount);
+    int first = 0;
+    for (int split : splits) {
+      ranges.add(new int[] {first, split});
+      first = split + 1;
+    }
+
+    ranges.add(new int[] {first, size - 1});
+    return ranges;
+  }
+
+  /** Converts internal key representations to a number for gap comparison, or null. */
+  private static ToDoubleFunction<Object> numericConverter(Type type) {
+    switch (type.typeId()) {
+      case INTEGER:
+      case LONG:
+      case FLOAT:
+      case DOUBLE:
+      case DATE:
+      case TIME:
+      case TIMESTAMP:
+      case TIMESTAMP_NANO:
+        return value -> ((Number) value).doubleValue();
+      case DECIMAL:
+        return value -> ((BigDecimal) value).doubleValue();
+      default:
+        return null;
+    }
   }
 
   /** Outcome of a conversion, to be committed together with the data files of the batch. */
@@ -439,6 +611,50 @@ public class EqualityDeleteConverter {
       }
 
       return referenced;
+    }
+  }
+
+  /** Equality delete files that share the equality fields and the partition. */
+  private static class DeleteGroup {
+    private final Set<Integer> equalityFieldIds;
+    private final PartitionSpec spec;
+    private final StructLikeWrapper partition;
+
+    DeleteGroup(Set<Integer> equalityFieldIds, PartitionSpec spec, StructLike partition) {
+      this.equalityFieldIds = equalityFieldIds;
+      this.spec = spec;
+      this.partition = StructLikeWrapper.forType(spec.partitionType()).set(partition);
+    }
+
+    Set<Integer> equalityFieldIds() {
+      return equalityFieldIds;
+    }
+
+    PartitionSpec spec() {
+      return spec;
+    }
+
+    StructLike partition() {
+      return partition.get();
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      } else if (!(other instanceof DeleteGroup)) {
+        return false;
+      }
+
+      DeleteGroup that = (DeleteGroup) other;
+      return equalityFieldIds.equals(that.equalityFieldIds)
+          && spec.specId() == that.spec.specId()
+          && partition.equals(that.partition);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(equalityFieldIds, spec.specId(), partition);
     }
   }
 
