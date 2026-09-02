@@ -180,6 +180,7 @@ project(':iceberg-kafka-connect:iceberg-kafka-connect-runtime') {
     integrationImplementation project(':iceberg-api')
     integrationImplementation project(':iceberg-common')
     integrationImplementation project(':iceberg-core')
+    integrationImplementation project(':iceberg-data')
     integrationImplementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
     integrationImplementation platform(libs.jackson.bom)
     integrationImplementation libs.jackson.core
