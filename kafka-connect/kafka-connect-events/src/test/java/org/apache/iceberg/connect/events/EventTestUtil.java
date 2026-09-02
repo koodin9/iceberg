@@ -95,4 +95,21 @@ class EventTestUtil {
         .withSplitOffsets(ImmutableList.of(4L))
         .build();
   }
+
+  static DeleteFile createDeletionVector() {
+    PartitionData data = new PartitionData(SPEC.partitionType());
+    data.set(0, 1L);
+
+    return FileMetadata.deleteFileBuilder(SPEC)
+        .ofPositionDeletes()
+        .withFormat(FileFormat.PUFFIN)
+        .withPath("path/to/file.puffin")
+        .withPartition(data)
+        .withFileSizeInBytes(100L)
+        .withRecordCount(2L)
+        .withReferencedDataFile("path/to/file.parquet")
+        .withContentOffset(4L)
+        .withContentSizeInBytes(40L)
+        .build();
+  }
 }

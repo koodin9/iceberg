@@ -71,6 +71,8 @@ for exactly-once semantics. This requires Kafka 2.5 or later.
 | iceberg.tables.evolve-schema-enabled       | Set to `true` to add any missing record fields to the table schema, default is `false`                           |
 | iceberg.tables.schema-force-optional       | Set to `true` to set columns as optional during table create and evolution, default is `false` to respect schema |
 | iceberg.tables.schema-case-insensitive     | Set to `true` to look up table columns by case-insensitive name, default is `false` for case-sensitive           |
+| iceberg.tables.cdc-field                   | Source record field that holds the CDC operation (`I`, `U` or `D`), see [CDC and upsert writes](#cdc-and-upsert-writes) |
+| iceberg.tables.upsert-mode-enabled         | Set to `true` to treat every record as an upsert on the identifier fields, default is `false`                     |
 | iceberg.tables.auto-create-props.*         | Properties set on new tables during auto-create                                                                  |
 | iceberg.tables.write-props.*               | Properties passed through to Iceberg writer initialization, these take precedence                                |
 | iceberg.table.<_table-name_\>.commit-branch | Table-specific branch for commits, use `iceberg.tables.default-commit-branch` if not specified                   |
@@ -93,6 +95,32 @@ for exactly-once semantics. This requires Kafka 2.5 or later.
 If `iceberg.tables.dynamic-enabled` is `false` (the default) then you must specify `iceberg.tables`. If
 `iceberg.tables.dynamic-enabled` is `true` then you must specify `iceberg.tables.route-field` which will
 contain the name of the table.
+
+### CDC and upsert writes
+
+By default the sink appends every record. Tables that have identifier fields (or an `id-columns`
+setting) can instead receive inserts, updates and deletes:
+
+* `iceberg.tables.cdc-field` names the record field that holds the change type. Accepted values are
+  `I`, `U` and `D` as produced by the `DebeziumTransform` and `DmsTransform` SMTs, the raw Debezium
+  codes `c`, `r`, `u` and `d`, and the names `insert`, `update` and `delete`. Any other value fails the
+  record. The field is read from the Kafka record, so it does not need to exist in the table schema.
+* `iceberg.tables.upsert-mode-enabled` treats every record as an upsert: the previous row with the same
+  identifier values is deleted before the new row is written. Use this when the source does not carry an
+  operation field. The two settings can be combined.
+
+Updates and deletes of rows that were committed earlier are written as equality delete files on the
+identifier fields. Rows written earlier in the same commit are removed with a position delete
+instead; on format version 3 tables this is a deletion vector. Requirements:
+
+* Every table written in this mode must have identifier fields or an `id-columns` setting, otherwise
+  the writer fails.
+* For partitioned tables every partition source column must be an identifier field, because a
+  delete is written into the partition of the record.
+* The identifier fields must be top-level columns.
+
+A schema change in the middle of a commit replaces the writer, so a duplicate key that straddles the
+change is not deduplicated within that commit.
 
 ### Kafka configuration
 

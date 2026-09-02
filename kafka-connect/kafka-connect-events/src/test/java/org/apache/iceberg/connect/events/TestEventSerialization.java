@@ -22,6 +22,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.Arrays;
 import java.util.UUID;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.junit.jupiter.api.Test;
 
@@ -52,10 +54,20 @@ public class TestEventSerialization {
                 commitId,
                 TableReference.of("catalog", TableIdentifier.of("db", "tbl"), UUID.randomUUID()),
                 Arrays.asList(EventTestUtil.createDataFile(), EventTestUtil.createDataFile()),
-                Arrays.asList(EventTestUtil.createDeleteFile(), EventTestUtil.createDeleteFile())));
+                Arrays.asList(
+                    EventTestUtil.createDeleteFile(),
+                    EventTestUtil.createDeleteFile(),
+                    EventTestUtil.createDeletionVector())));
 
     byte[] data = AvroUtil.encode(event);
     Event result = AvroUtil.decode(data);
+
+    // deletion vector fields must survive the trip through the control topic
+    DeleteFile dv = ((DataWritten) result.payload()).deleteFiles().get(2);
+    assertThat(dv.format()).isEqualTo(FileFormat.PUFFIN);
+    assertThat(dv.referencedDataFile()).isEqualTo("path/to/file.parquet");
+    assertThat(dv.contentOffset()).isEqualTo(4L);
+    assertThat(dv.contentSizeInBytes()).isEqualTo(40L);
 
     assertThat(result)
         .usingRecursiveComparison()

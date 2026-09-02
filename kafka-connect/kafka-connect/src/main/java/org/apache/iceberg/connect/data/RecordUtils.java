@@ -24,8 +24,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.connect.IcebergSinkConfig;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.data.GenericFileWriterFactory;
@@ -129,6 +131,12 @@ class RecordUtils {
               .collect(Collectors.toSet());
     }
 
+    boolean deltaMode = config.tablesCdcField() != null || config.upsertModeEnabled();
+    Preconditions.checkArgument(
+        !deltaMode || (identifierFieldIds != null && !identifierFieldIds.isEmpty()),
+        "Table %s has no identifier fields, set id-columns to use CDC or upsert mode",
+        tableReference.identifier());
+
     FileWriterFactory<Record> writerFactory;
     if (identifierFieldIds == null || identifierFieldIds.isEmpty()) {
       writerFactory =
@@ -158,6 +166,11 @@ class RecordUtils {
             .format(format)
             .build();
 
+    if (deltaMode) {
+      return createDeltaWriter(
+          table, config, format, writerFactory, fileFactory, targetFileSize, identifierFieldIds);
+    }
+
     TaskWriter<Record> writer;
     if (table.spec().isUnpartitioned()) {
       writer =
@@ -175,6 +188,56 @@ class RecordUtils {
               table.schema());
     }
     return writer;
+  }
+
+  private static TaskWriter<Record> createDeltaWriter(
+      Table table,
+      IcebergSinkConfig config,
+      FileFormat format,
+      FileWriterFactory<Record> writerFactory,
+      OutputFileFactory fileFactory,
+      long targetFileSize,
+      Set<Integer> equalityFieldIds) {
+    // format version 3 requires deletion vectors for position deletes
+    boolean useDv = TableUtil.formatVersion(table) >= 3;
+    boolean upsert = config.upsertModeEnabled();
+
+    if (table.spec().isUnpartitioned()) {
+      return new UnpartitionedDeltaWriter(
+          table.spec(),
+          format,
+          writerFactory,
+          fileFactory,
+          table.io(),
+          targetFileSize,
+          table.schema(),
+          equalityFieldIds,
+          upsert,
+          useDv);
+    }
+
+    // a delete is written into the partition of the record, so the partition must be derivable
+    // from the identifier fields or the delete would miss rows in other partitions
+    for (PartitionField field : table.spec().fields()) {
+      Preconditions.checkArgument(
+          equalityFieldIds.contains(field.sourceId()),
+          "Partition field %s uses source column %s which is not an identifier field, "
+              + "partition columns must be a subset of the id-columns for CDC or upsert mode",
+          field.name(),
+          table.schema().findColumnName(field.sourceId()));
+    }
+
+    return new PartitionedDeltaWriter(
+        table.spec(),
+        format,
+        writerFactory,
+        fileFactory,
+        table.io(),
+        targetFileSize,
+        table.schema(),
+        equalityFieldIds,
+        upsert,
+        useDv);
   }
 
   private RecordUtils() {}

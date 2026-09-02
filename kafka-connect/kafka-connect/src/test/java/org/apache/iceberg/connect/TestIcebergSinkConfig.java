@@ -60,6 +60,29 @@ public class TestIcebergSinkConfig {
   }
 
   @Test
+  public void testCdcConfig() {
+    Map<String, String> props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "source-topic",
+            "iceberg.tables", "db.landing");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.tablesCdcField()).isNull();
+    assertThat(config.upsertModeEnabled()).isFalse();
+
+    props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "source-topic",
+            "iceberg.tables", "db.landing",
+            "iceberg.tables.cdc-field", "_cdc.op",
+            "iceberg.tables.upsert-mode-enabled", "true");
+    config = new IcebergSinkConfig(props);
+    assertThat(config.tablesCdcField()).isEqualTo("_cdc.op");
+    assertThat(config.upsertModeEnabled()).isTrue();
+  }
+
+  @Test
   public void testStringToList() {
     List<String> result = IcebergSinkConfig.stringToList(null, ",");
     assertThat(result).isEmpty();

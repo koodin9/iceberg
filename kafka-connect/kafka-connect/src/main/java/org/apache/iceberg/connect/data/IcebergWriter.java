@@ -29,6 +29,7 @@ import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.WriteResult;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -41,6 +42,7 @@ class IcebergWriter implements RecordWriter {
 
   private RecordConverter recordConverter;
   private TaskWriter<Record> writer;
+  private BaseDeltaWriter deltaWriter;
 
   IcebergWriter(Table table, TableReference tableReference, IcebergSinkConfig config) {
     this.table = table;
@@ -52,6 +54,7 @@ class IcebergWriter implements RecordWriter {
 
   private void initNewWriter() {
     this.writer = RecordUtils.createTableWriter(table, tableReference, config);
+    this.deltaWriter = writer instanceof BaseDeltaWriter ? (BaseDeltaWriter) writer : null;
     this.recordConverter = new RecordConverter(table, config);
   }
 
@@ -61,7 +64,11 @@ class IcebergWriter implements RecordWriter {
       // ignore tombstones...
       if (record.value() != null) {
         Record row = convertToRow(record);
-        writer.write(row);
+        if (deltaWriter != null) {
+          deltaWriter.write(row, operation(record));
+        } else {
+          writer.write(row);
+        }
       }
     } catch (Exception e) {
       throw new DataException(
@@ -73,6 +80,23 @@ class IcebergWriter implements RecordWriter {
               record.kafkaOffset()),
           e);
     }
+  }
+
+  /**
+   * Resolves the CDC operation from the source record. The field is read from the Kafka record
+   * value, not from the converted row, so the table does not need a column for it.
+   */
+  private Operation operation(SinkRecord record) {
+    String cdcField = config.tablesCdcField();
+    if (cdcField == null) {
+      // without an operation field every record is an insert, upsert mode adds the key delete
+      return Operation.INSERT;
+    }
+
+    Object value = RecordUtils.extractFromRecordValue(record.value(), cdcField);
+    Preconditions.checkArgument(
+        value != null, "CDC field %s is missing or null in the record", cdcField);
+    return Operation.fromString(value.toString());
   }
 
   private Record convertToRow(SinkRecord record) {
