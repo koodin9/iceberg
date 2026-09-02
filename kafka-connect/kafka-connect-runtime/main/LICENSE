@@ -846,7 +846,7 @@ License: Apache License, Version 2.0 - https://www.apache.org/licenses/LICENSE-2
 
 --------------------------------------------------------------------------------
 
-This product bundles Apache Hadoop (annotations and common).
+This product bundles Apache Hadoop (annotations, common and mapreduce-client-core).
 
 Project URL: https://hadoop.apache.org
 License: Apache License, Version 2.0 - https://www.apache.org/licenses/LICENSE-2.0

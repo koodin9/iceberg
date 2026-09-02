@@ -116,6 +116,11 @@ project(':iceberg-kafka-connect:iceberg-kafka-connect-runtime') {
       exclude group: 'org.apache.hadoop.thirdparty', module: 'hadoop-shaded-protobuf_3_7'
       exclude group: 'org.eclipse.jetty'
     }
+    // Parquet reads link against ParquetInputFormat, whose superclass lives in
+    // hadoop-mapreduce-client-core. The sink reads Parquet when it converts equality deletes.
+    implementation(libs.hadoop3.mapreduce.client.core) {
+      transitive = false
+    }
     implementation project(':iceberg-orc')
     implementation project(':iceberg-parquet')
 
