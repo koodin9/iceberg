@@ -130,6 +130,7 @@ public class EqualityDeleteConverter {
     BaseDVFileWriter dvWriter = new BaseDVFileWriter(fileFactory, previousDeletes::get);
 
     Expression conflictFilter = Expressions.alwaysFalse();
+    int comparisonsPerFile = KeyFilters.comparisonsPerFile(base);
     long matchedRows = 0L;
     long deletedKeys = 0L;
     scannedDataFiles.set(0);
@@ -150,7 +151,7 @@ public class EqualityDeleteConverter {
                 conflictFilter,
                 Expressions.and(
                     KeyFilters.partitionFilter(table.schema(), group.spec(), group.partition()),
-                    KeyFilters.keyFilter(keySchema, keys)));
+                    KeyFilters.keyFilter(keySchema, keys, comparisonsPerFile)));
 
         KeyPositionResolver.Resolution resolution =
             resolver.resolve(base, keySchema, keys, group.spec(), group.partition());

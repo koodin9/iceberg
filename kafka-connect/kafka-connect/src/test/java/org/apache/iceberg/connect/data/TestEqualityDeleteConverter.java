@@ -183,7 +183,7 @@ public class TestEqualityDeleteConverter {
   }
 
   @Test
-  public void testLargeKeySetUsesRangeFilter() throws IOException {
+  public void testManyKeys() throws IOException {
     Table table = createTable(PartitionSpec.unpartitioned());
 
     List<Object[]> inserts = Lists.newArrayList();
@@ -244,7 +244,7 @@ public class TestEqualityDeleteConverter {
     EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
     EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
 
-    // more keys than the IN limit, so the keys are split into ranges at the largest gaps: the hot
+    // more keys than one IN list holds, so the keys are matched with several lists: the hot
     // range covers six files and every scattered key stays in its own file
     assertThat(deletes).hasSizeGreaterThan(KeyFilters.IN_PREDICATE_LIMIT);
     assertThat(converter.scannedDataFiles()).isEqualTo(11);
@@ -256,7 +256,7 @@ public class TestEqualityDeleteConverter {
   }
 
   @Test
-  public void testRangeFilterIsScopedToPartition() throws IOException {
+  public void testPartitionIsPinnedWithManyKeys() throws IOException {
     Table table = createTable(PartitionSpec.builderFor(SCHEMA).identity("category").build());
     TableSinkConfig tableConfig = mock(TableSinkConfig.class);
     when(tableConfig.idColumns()).thenReturn(ImmutableList.of("id", "category"));
@@ -285,7 +285,7 @@ public class TestEqualityDeleteConverter {
     EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
     EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
 
-    // the range on id covers every file of both partitions, the partition pins it to a
+    // the id filter alone covers files of both partitions, the partition pins it to a
     assertThat(converter.scannedDataFiles()).isEqualTo(3);
     assertThat(result.dvFiles()).hasSize(3);
 
@@ -296,7 +296,7 @@ public class TestEqualityDeleteConverter {
   }
 
   @Test
-  public void testTransformPartitionIsPinnedInRangeMode() throws IOException {
+  public void testTransformPartitionIsPinnedWithManyKeys() throws IOException {
     Table table = createTable(PartitionSpec.builderFor(SCHEMA).bucket("id", 4).build());
 
     // three batches, each writes one file per bucket
@@ -330,13 +330,53 @@ public class TestEqualityDeleteConverter {
     EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
     EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
 
-    // the id range covers every file, the pinned bucket keeps only the three files of bucket 0
+    // the pinned bucket keeps only the three files of bucket 0
     assertThat(converter.scannedDataFiles()).isEqualTo(3);
     assertThat(result.dvFiles()).hasSize(3);
     assertThat(result.dvFiles().stream().mapToLong(DeleteFile::recordCount).sum()).isEqualTo(250L);
 
     commit(table, second.dataFiles(), result.dvFiles(), result.rewrittenDvFiles());
     assertThat(readRows(table)).hasSize(3000 - 250);
+  }
+
+  @Test
+  public void testScatteredKeysAreMatchedWithLists() throws IOException {
+    Table table = createTable(PartitionSpec.unpartitioned());
+
+    // 200 data files with 50 consecutive ids each
+    int fileCount = 200;
+    int rowsPerFile = 50;
+    List<DataFile> dataFiles = Lists.newArrayList();
+    for (int file = 0; file < fileCount; file++) {
+      List<Object[]> inserts = Lists.newArrayList();
+      for (int row = 0; row < rowsPerFile; row++) {
+        inserts.add(insert((long) file * rowsPerFile + row, "a", "v1"));
+      }
+      dataFiles.add(write(table, inserts.toArray(new Object[0][])).dataFiles()[0]);
+    }
+    commit(table, dataFiles.toArray(new DataFile[0]), new DeleteFile[0], ImmutableList.of());
+
+    // 300 hot keys in the last six files plus one key in each of the first 150 files: more
+    // scattered keys than value ranges could isolate, so the keys are matched with IN lists
+    List<Object[]> deletes = Lists.newArrayList();
+    for (long id = 9700; id < 10000; id++) {
+      deletes.add(delete(id, "a"));
+    }
+    for (int file = 0; file < 150; file++) {
+      deletes.add(delete((long) file * rowsPerFile + 7, "a"));
+    }
+    WriteResult second = write(table, deletes.toArray(new Object[0][]));
+
+    EqualityDeleteConverter converter = new EqualityDeleteConverter(table, null);
+    EqualityDeleteConverter.Result result = converter.convert(Arrays.asList(second.deleteFiles()));
+
+    // exactly the files that hold a deleted key are read: 6 hot files and 150 scattered files
+    assertThat(converter.scannedDataFiles()).isEqualTo(156);
+    assertThat(result.dvFiles()).hasSize(156);
+    assertThat(result.dvFiles().stream().mapToLong(DeleteFile::recordCount).sum()).isEqualTo(450L);
+
+    commit(table, second.dataFiles(), result.dvFiles(), result.rewrittenDvFiles());
+    assertThat(readRows(table)).hasSize(fileCount * rowsPerFile - 450);
   }
 
   @Test
@@ -415,26 +455,34 @@ public class TestEqualityDeleteConverter {
       values.add(value);
     }
 
+    // adjacent integers are never split, so the only split is the gap between 199 and 1000
     List<int[]> ranges =
-        KeyFilters.splitIntoRanges(values, value -> ((Number) value).doubleValue());
-    assertThat(ranges).hasSize(KeyFilters.MAX_KEY_RANGES);
-    assertThat(ranges.get(0)[0]).isEqualTo(0);
-    assertThat(ranges.get(ranges.size() - 1)[1]).isEqualTo(values.size() - 1);
-    for (int i = 1; i < ranges.size(); i++) {
-      assertThat(ranges.get(i)[0]).isEqualTo(ranges.get(i - 1)[1] + 1);
+        KeyFilters.splitIntoRanges(values, value -> ((Number) value).doubleValue(), 100);
+    assertThat(ranges).hasSize(2);
+    assertThat(ranges.get(0)).containsExactly(0, 199);
+    assertThat(ranges.get(1)).containsExactly(200, 299);
+
+    // with scattered values every gap qualifies and the range count is capped
+    List<Object> scattered = Lists.newArrayList();
+    for (long value = 0; value < 300; value++) {
+      scattered.add(value * 10);
     }
-    // no range spans the gap between 199 and 1000
-    assertThat(ranges)
-        .noneMatch(
-            range -> (long) values.get(range[0]) <= 199L && (long) values.get(range[1]) >= 1000L);
+    List<int[]> capped =
+        KeyFilters.splitIntoRanges(scattered, value -> ((Number) value).doubleValue(), 100);
+    assertThat(capped).hasSize(100);
+    assertThat(capped.get(0)[0]).isEqualTo(0);
+    assertThat(capped.get(capped.size() - 1)[1]).isEqualTo(scattered.size() - 1);
+    for (int i = 1; i < capped.size(); i++) {
+      assertThat(capped.get(i)[0]).isEqualTo(capped.get(i - 1)[1] + 1);
+    }
 
     // without a numeric converter the values are split into ranges of equal size
-    List<int[]> equalRanges = KeyFilters.splitIntoRanges(values, null);
-    assertThat(equalRanges).hasSize(KeyFilters.MAX_KEY_RANGES);
+    List<int[]> equalRanges = KeyFilters.splitIntoRanges(values, null, 100);
+    assertThat(equalRanges).hasSize(100);
     assertThat(equalRanges).allMatch(range -> range[1] - range[0] + 1 == 3);
 
     // fewer values than ranges: one range per value
-    List<int[]> single = KeyFilters.splitIntoRanges(values.subList(0, 5), null);
+    List<int[]> single = KeyFilters.splitIntoRanges(values.subList(0, 5), null, 100);
     assertThat(single).hasSize(5);
     assertThat(single).allMatch(range -> range[0] == range[1]);
   }

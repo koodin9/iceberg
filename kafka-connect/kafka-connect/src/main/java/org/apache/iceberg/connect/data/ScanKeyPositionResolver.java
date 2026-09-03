@@ -59,12 +59,12 @@ import org.apache.iceberg.util.ThreadPools;
  * Resolves deleted keys by scanning data files. No state is kept between calls.
  *
  * <p>The candidate files are planned with the filters of {@link KeyFilters}: the partition of the
- * equality delete files is pinned through its transform and the keys are matched with an {@code IN}
- * list or, above {@link KeyFilters#IN_PREDICATE_LIMIT} keys, with value ranges split at the largest
- * gaps of the leading key column. Only the key columns and the row position of the candidate files
- * are read, in parallel, and a row is matched by comparing its key with the deleted set. A cluster
- * of hot keys and a few scattered keys therefore cost the files that hold them; keys spread evenly
- * over a large table still match most files of the partition.
+ * equality delete files is pinned through its transform and the keys are matched with {@code IN}
+ * lists while they fit the comparison budget the table's data file count allows, with value ranges
+ * split at the largest gaps of the leading key column above that. Only the key columns and the row
+ * position of the candidate files are read, in parallel, and a row is matched by comparing its key
+ * with the deleted set. A cluster of hot keys and a few scattered keys therefore cost the files
+ * that hold them; keys spread evenly over a large table still match most files of the partition.
  *
  * <p>Data files that carry position delete files instead of deletion vectors are rejected, because
  * a deletion vector replaces all position deletes of its data file.
@@ -91,7 +91,8 @@ class ScanKeyPositionResolver implements KeyPositionResolver {
     // to
     // the file readers, whose row group filters evaluate column references, not partition
     // transforms
-    Expression keyFilter = KeyFilters.keyFilter(keySchema, keys);
+    Expression keyFilter =
+        KeyFilters.keyFilter(keySchema, keys, KeyFilters.comparisonsPerFile(base));
     Expression planFilter =
         Expressions.and(
             KeyFilters.partitionFilter(table.schema(), deleteSpec, deletePartition), keyFilter);

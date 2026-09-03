@@ -142,9 +142,11 @@ Requirements and behavior:
 * Candidate files are pruned per partition with the column statistics of the identifier columns.
   The partition of each equality delete file is pinned through its transform (for example
   `bucket(16, id) = 3`), so partition pruning also applies when the key filter is a range that the
-  transform cannot project. Up to 200 deleted keys are matched with an `IN` list, a larger key set
-  is split at the largest gaps of the leading identifier column into at most 100 value ranges. The
-  cost of a commit therefore
+  transform cannot project. The filter's size follows the table's data file count, so that planning
+  spends a bounded number of comparisons: while the deleted keys fit that budget they are matched
+  with `IN` lists of 200 keys, which select exactly the files holding a key; larger sets are split
+  at the largest gaps of the leading identifier column into value ranges. The cost of a commit
+  therefore
   grows with the number of data files that hold a deleted key, plus files whose statistics overlap
   the ranges. This works well when the changed keys of a commit cluster in a few files, which is
   typical for recently inserted rows. Keys that are spread evenly over a large table, such as random
