@@ -34,6 +34,7 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.testcontainers.containers.ComposeContainer;
+import org.testcontainers.containers.ContainerState;
 import org.testcontainers.containers.wait.strategy.Wait;
 
 public class TestContext {
@@ -57,12 +58,23 @@ public class TestContext {
     return instance;
   }
 
+  private final ComposeContainer container;
+
   private TestContext() {
-    ComposeContainer container =
+    this.container =
         new ComposeContainer(new File("./docker/docker-compose.yml"))
             .withStartupTimeout(Duration.ofMinutes(2))
             .waitingFor("connect", Wait.forHttp("/connectors"));
     container.start();
+  }
+
+  /** Log output of the Kafka Connect worker container so far. */
+  public String connectLogs() {
+    return container
+        .getContainerByServiceName("connect-1")
+        .or(() -> container.getContainerByServiceName("connect_1"))
+        .map(ContainerState::getLogs)
+        .orElse("");
   }
 
   public void startConnector(KafkaConnectUtils.Config config) {
